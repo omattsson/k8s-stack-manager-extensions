@@ -1,0 +1,11 @@
+{
+  "actions": [
+    {
+      "name": "debug-bundle",
+      "url": "http://debug-bundle.extensions.svc.cluster.local:8080/action",
+      "description": "Collect pod logs, events, and diagnostics into a downloadable archive",
+      "timeout_seconds": 60,
+      "secret_env": "DEBUG_BUNDLE_SECRET"
+    }
+  ]
+}

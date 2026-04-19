@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: extensions
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: debug-bundle
+  namespace: extensions
+type: Opaque
+stringData:
+  DEBUG_BUNDLE_SECRET: "REPLACE_ME"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: debug-bundle-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: debug-bundle
+  namespace: extensions
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: debug-bundle-reader
+subjects:
+  - kind: ServiceAccount
+    name: debug-bundle
+    namespace: extensions
+roleRef:
+  kind: ClusterRole
+  name: debug-bundle-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: debug-bundle
+  namespace: extensions
+  labels:
+    app: debug-bundle
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: debug-bundle
+  template:
+    metadata:
+      labels:
+        app: debug-bundle
+    spec:
+      serviceAccountName: debug-bundle
+      containers:
+        - name: debug-bundle
+          image: debug-bundle:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: debug-bundle
+          env:
+            - name: BUNDLE_OUTPUT_DIR
+              value: "/tmp/bundles"
+            - name: BUNDLE_TTL_HOURS
+              value: "24"
+            - name: LOG_TAIL_LINES
+              value: "500"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: bundles
+              mountPath: /tmp/bundles
+      volumes:
+        - name: bundles
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: debug-bundle
+  namespace: extensions
+spec:
+  selector:
+    app: debug-bundle
+  ports:
+    - port: 8080
+      targetPort: 8080

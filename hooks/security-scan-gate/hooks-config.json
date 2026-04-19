@@ -1,0 +1,12 @@
+{
+  "subscriptions": [
+    {
+      "name": "security-scan-gate",
+      "events": ["pre-deploy"],
+      "url": "http://security-scan-gate.extensions.svc.cluster.local:8080/hook",
+      "timeout_seconds": 15,
+      "failure_policy": "fail",
+      "secret_env": "SCANNER_WEBHOOK_SECRET"
+    }
+  ]
+}

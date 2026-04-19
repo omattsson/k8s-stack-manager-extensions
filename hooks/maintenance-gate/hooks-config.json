@@ -1,0 +1,12 @@
+{
+  "subscriptions": [
+    {
+      "name": "maintenance-gate",
+      "events": ["pre-deploy"],
+      "url": "http://maintenance-gate.extensions.svc.cluster.local:8080/hook",
+      "timeout_seconds": 3,
+      "failure_policy": "fail",
+      "secret_env": "GATE_WEBHOOK_SECRET"
+    }
+  ]
+}

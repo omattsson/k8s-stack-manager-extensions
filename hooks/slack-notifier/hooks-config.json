@@ -1,0 +1,12 @@
+{
+  "subscriptions": [
+    {
+      "name": "slack-notifier",
+      "events": ["deploy-finalized"],
+      "url": "http://slack-notifier.extensions.svc.cluster.local:8080/hook",
+      "timeout_seconds": 5,
+      "failure_policy": "ignore",
+      "secret_env": "SLACK_WEBHOOK_SECRET"
+    }
+  ]
+}

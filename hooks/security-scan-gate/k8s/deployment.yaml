@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: extensions
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: security-scan-gate
+  namespace: extensions
+type: Opaque
+stringData:
+  SCANNER_WEBHOOK_SECRET: "REPLACE_ME"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-scan-gate
+  namespace: extensions
+  labels:
+    app: security-scan-gate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: security-scan-gate
+  template:
+    metadata:
+      labels:
+        app: security-scan-gate
+    spec:
+      containers:
+        - name: security-scan-gate
+          image: security-scan-gate:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: security-scan-gate
+          env:
+            - name: SEVERITY_THRESHOLD
+              value: "CRITICAL,HIGH"
+            - name: CACHE_TTL_MINUTES
+              value: "30"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-scan-gate
+  namespace: extensions
+spec:
+  selector:
+    app: security-scan-gate
+  ports:
+    - port: 8080
+      targetPort: 8080
