@@ -4,6 +4,7 @@ import hmac
 import http.client
 import json
 import os
+import queue
 import tempfile
 import threading
 import time
@@ -136,7 +137,7 @@ class TestDeliveryLog(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Integration tests — relay to a real destination
+# Integration tests — relay_to_destination (called directly, bypasses queue)
 # ---------------------------------------------------------------------------
 class TestRelayToDestination(unittest.TestCase):
     @classmethod
@@ -249,7 +250,82 @@ class TestRelayRetry(unittest.TestCase):
             os.unlink(log_path)
 
 
-class TestDispatchEventFilter(unittest.TestCase):
+# ---------------------------------------------------------------------------
+# Queue + worker pool tests
+# ---------------------------------------------------------------------------
+class TestDispatchQueue(unittest.TestCase):
+    """Test that dispatch enqueues work items instead of blocking."""
+
+    def test_dispatch_enqueues_matching_destinations(self):
+        q = queue.Queue(maxsize=100)
+        dest = {
+            "name": "q-test",
+            "url": "http://localhost:9999/hook",
+            "events": ["deploy-finalized"],
+            "headers": {},
+        }
+        body = json.dumps(SAMPLE_ENVELOPE).encode()
+        with patch.object(server, "DESTINATIONS", [dest]), \
+             patch.object(server, "_work_queue", q):
+            count = server.dispatch(SAMPLE_ENVELOPE, body, "req-q1")
+
+        self.assertEqual(count, 1)
+        self.assertEqual(q.qsize(), 1)
+        item = q.get_nowait()
+        self.assertEqual(item[0]["name"], "q-test")
+
+    def test_dispatch_skips_non_matching_events(self):
+        q = queue.Queue(maxsize=100)
+        dest = {
+            "name": "q-skip",
+            "url": "http://localhost:9999/hook",
+            "events": ["post-instance-create"],
+            "headers": {},
+        }
+        body = json.dumps(SAMPLE_ENVELOPE).encode()
+        with patch.object(server, "DESTINATIONS", [dest]), \
+             patch.object(server, "_work_queue", q):
+            count = server.dispatch(SAMPLE_ENVELOPE, body, "req-q2")
+
+        self.assertEqual(count, 0)
+        self.assertTrue(q.empty())
+
+    def test_dispatch_empty_events_matches_all(self):
+        q = queue.Queue(maxsize=100)
+        dest = {
+            "name": "q-all",
+            "url": "http://localhost:9999/hook",
+            "events": [],
+            "headers": {},
+        }
+        env = {**SAMPLE_ENVELOPE, "event": "post-instance-delete"}
+        body = json.dumps(env).encode()
+        with patch.object(server, "DESTINATIONS", [dest]), \
+             patch.object(server, "_work_queue", q):
+            count = server.dispatch(env, body, "req-q3")
+
+        self.assertEqual(count, 1)
+
+    def test_dispatch_drops_when_queue_full(self):
+        q = queue.Queue(maxsize=1)
+        q.put("filler")
+        dest = {
+            "name": "q-full",
+            "url": "http://localhost:9999/hook",
+            "events": [],
+            "headers": {},
+        }
+        body = json.dumps(SAMPLE_ENVELOPE).encode()
+        original_dropped = server.get_dropped_count()
+        with patch.object(server, "DESTINATIONS", [dest]), \
+             patch.object(server, "_work_queue", q):
+            count = server.dispatch(SAMPLE_ENVELOPE, body, "req-q4")
+
+        self.assertEqual(count, 0)
+        self.assertGreater(server.get_dropped_count(), original_dropped)
+
+
+class TestWorkerPool(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _RecordingHandler.requests_received = []
@@ -267,51 +343,88 @@ class TestDispatchEventFilter(unittest.TestCase):
     def setUp(self):
         _RecordingHandler.requests_received = []
 
-    def test_matching_event_dispatches(self):
+    def test_worker_processes_queue_item(self):
+        q = queue.Queue(maxsize=100)
         dest = {
-            "name": "match",
+            "name": "w-test",
+            "url": f"http://127.0.0.1:{self.dest_port}/hook",
+            "headers": {},
+            "events": [],
+        }
+        body = json.dumps(SAMPLE_ENVELOPE).encode()
+        q.put((dest, SAMPLE_ENVELOPE, body, "req-w1"))
+        q.put(None)
+
+        with patch.object(server, "_work_queue", q), \
+             patch.object(server, "LOG_FILE", ""), \
+             patch.object(server, "MAX_RETRIES", 1):
+            server._worker()
+
+        self.assertEqual(len(_RecordingHandler.requests_received), 1)
+        self.assertEqual(_RecordingHandler.requests_received[0]["body"]["event"], "deploy-finalized")
+
+    def test_worker_survives_exception(self):
+        q = queue.Queue(maxsize=100)
+        dest = {
+            "name": "w-err",
+            "url": "http://127.0.0.1:1/never",
+            "headers": {},
+            "events": [],
+        }
+        body = json.dumps(SAMPLE_ENVELOPE).encode()
+        q.put((dest, SAMPLE_ENVELOPE, body, "req-w2"))
+        q.put(None)
+
+        with patch.object(server, "_work_queue", q), \
+             patch.object(server, "LOG_FILE", ""), \
+             patch.object(server, "MAX_RETRIES", 1), \
+             patch.object(server, "REQUEST_TIMEOUT", 1):
+            server._worker()
+
+        self.assertTrue(q.empty())
+
+    def test_start_and_stop_workers(self):
+        old_workers = server._workers.copy()
+        server._workers.clear()
+
+        q = queue.Queue(maxsize=100)
+        with patch.object(server, "_work_queue", q):
+            server.start_workers(count=3)
+            self.assertEqual(len(server._workers), 3)
+            for t in server._workers:
+                self.assertTrue(t.is_alive())
+            server.stop_workers()
+
+        self.assertEqual(len(server._workers), 0)
+        server._workers.extend(old_workers)
+
+    def test_end_to_end_dispatch_through_workers(self):
+        """Dispatch enqueues, workers pick up and deliver to the real destination."""
+        q = queue.Queue(maxsize=100)
+        dest = {
+            "name": "e2e",
             "url": f"http://127.0.0.1:{self.dest_port}/hook",
             "events": ["deploy-finalized"],
-            "headers": {},
+            "headers": {"X-E2E": "yes"},
         }
         body = json.dumps(SAMPLE_ENVELOPE).encode()
-        with patch.object(server, "DESTINATIONS", [dest]), \
+
+        old_workers = server._workers.copy()
+        server._workers.clear()
+
+        with patch.object(server, "_work_queue", q), \
+             patch.object(server, "DESTINATIONS", [dest]), \
              patch.object(server, "LOG_FILE", ""), \
              patch.object(server, "MAX_RETRIES", 1):
-            server.dispatch(SAMPLE_ENVELOPE, body, "req-match")
+            server.start_workers(count=2)
+            server.dispatch(SAMPLE_ENVELOPE, body, "req-e2e")
+            q.join()
+            server.stop_workers()
+
+        server._workers.extend(old_workers)
 
         self.assertEqual(len(_RecordingHandler.requests_received), 1)
-
-    def test_non_matching_event_skips(self):
-        dest = {
-            "name": "nomatch",
-            "url": f"http://127.0.0.1:{self.dest_port}/hook",
-            "events": ["post-instance-create"],
-            "headers": {},
-        }
-        body = json.dumps(SAMPLE_ENVELOPE).encode()
-        with patch.object(server, "DESTINATIONS", [dest]), \
-             patch.object(server, "LOG_FILE", ""), \
-             patch.object(server, "MAX_RETRIES", 1):
-            server.dispatch(SAMPLE_ENVELOPE, body, "req-nomatch")
-
-        self.assertEqual(len(_RecordingHandler.requests_received), 0)
-
-    def test_empty_events_matches_all(self):
-        dest = {
-            "name": "all",
-            "url": f"http://127.0.0.1:{self.dest_port}/hook",
-            "events": [],
-            "headers": {},
-        }
-        env = {**SAMPLE_ENVELOPE, "event": "post-instance-delete"}
-        body = json.dumps(env).encode()
-        with patch.object(server, "DESTINATIONS", [dest]), \
-             patch.object(server, "LOG_FILE", ""), \
-             patch.object(server, "MAX_RETRIES", 1):
-            server.dispatch(env, body, "req-all")
-
-        self.assertEqual(len(_RecordingHandler.requests_received), 1)
+        self.assertEqual(_RecordingHandler.requests_received[0]["headers"]["X-E2E"], "yes")
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +454,8 @@ class TestHTTPHandler(unittest.TestCase):
         body = json.loads(resp.read())
         self.assertEqual(body["status"], "ok")
         self.assertIn("destinations", body)
+        self.assertIn("queue_depth", body)
+        self.assertIn("dropped", body)
         conn.close()
 
     def test_get_unknown_returns_404(self):
@@ -374,6 +489,7 @@ class TestHTTPHandler(unittest.TestCase):
 
     @patch.object(server, "dispatch")
     def test_post_valid_envelope_returns_allowed(self, mock_dispatch):
+        mock_dispatch.return_value = 0
         body = json.dumps(SAMPLE_ENVELOPE).encode()
         with patch.object(server, "SECRET", ""):
             conn = self._conn()
@@ -390,6 +506,7 @@ class TestHTTPHandler(unittest.TestCase):
 
     @patch.object(server, "dispatch")
     def test_post_with_valid_hmac(self, mock_dispatch):
+        mock_dispatch.return_value = 0
         body = json.dumps(SAMPLE_ENVELOPE).encode()
         sig = _sign(body)
         with patch.object(server, "SECRET", TEST_SECRET):

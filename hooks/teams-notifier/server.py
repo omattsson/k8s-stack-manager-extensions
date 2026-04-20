@@ -4,6 +4,9 @@
 Subscribes to deploy-finalized events from k8s-stack-manager and sends
 a formatted Adaptive Card message with instance details.
 
+Inbound requests are accepted immediately and Teams posts are processed by a
+fixed-size worker pool, so thread count stays bounded under load.
+
 Usage:
     export TEAMS_WEBHOOK_URL="https://your-tenant.webhook.office.com/webhookb2/..."
     export TEAMS_WEBHOOK_SECRET="your-shared-secret"
@@ -14,15 +17,23 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import sys
 import urllib.request
 import urllib.error
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
 SECRET = os.environ.get("TEAMS_WEBHOOK_SECRET", "")
 STACK_MANAGER_URL = os.environ.get("STACK_MANAGER_URL", "https://stack-manager.example")
 LISTEN_ADDR = os.environ.get("LISTEN_ADDR", ":8080")
+WORKER_COUNT = int(os.environ.get("TEAMS_WORKER_COUNT", "4"))
+QUEUE_SIZE = int(os.environ.get("TEAMS_QUEUE_SIZE", "500"))
+
+_work_queue = queue.Queue(maxsize=QUEUE_SIZE)
+_dropped = 0
+_dropped_lock = threading.Lock()
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -111,13 +122,71 @@ def post_to_teams(payload: dict) -> None:
         print(f"WARN teams post failed: {exc}", file=sys.stderr, flush=True)
 
 
+def _worker():
+    while True:
+        item = _work_queue.get()
+        if item is None:
+            break
+        try:
+            post_to_teams(item)
+        except Exception as exc:
+            print(f"ERROR worker unhandled exception: {exc}", file=sys.stderr, flush=True)
+        finally:
+            _work_queue.task_done()
+
+
+def enqueue_card(card: dict) -> bool:
+    """Enqueue a card for async delivery. Returns False if queue is full."""
+    global _dropped
+    try:
+        _work_queue.put_nowait(card)
+        return True
+    except queue.Full:
+        with _dropped_lock:
+            _dropped += 1
+        print("WARN queue full, dropped teams notification", file=sys.stderr, flush=True)
+        return False
+
+
+_workers: list[threading.Thread] = []
+
+
+def start_workers(count: int = WORKER_COUNT) -> None:
+    for _ in range(count):
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        _workers.append(t)
+
+
+def stop_workers() -> None:
+    for _ in _workers:
+        _work_queue.put(None)
+    for t in _workers:
+        t.join(timeout=10)
+    _workers.clear()
+
+
+def get_queue_depth() -> int:
+    return _work_queue.qsize()
+
+
+def get_dropped_count() -> int:
+    with _dropped_lock:
+        return _dropped
+
+
 class HookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/healthz":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            body = {
+                "status": "ok",
+                "queue_depth": get_queue_depth(),
+                "dropped": get_dropped_count(),
+            }
+            self.wfile.write(json.dumps(body).encode())
             return
         self.send_response(404)
         self.end_headers()
@@ -151,7 +220,7 @@ class HookHandler(BaseHTTPRequestHandler):
 
         if event == "deploy-finalized" and TEAMS_WEBHOOK_URL:
             card = build_adaptive_card(envelope)
-            post_to_teams(card)
+            enqueue_card(card)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -167,14 +236,22 @@ def main():
         print("FATAL TEAMS_WEBHOOK_URL is required", file=sys.stderr, flush=True)
         sys.exit(1)
 
+    print(
+        f"INFO teams-notifier workers={WORKER_COUNT} queue_size={QUEUE_SIZE}",
+        flush=True,
+    )
+
+    start_workers()
+
     host, _, port = LISTEN_ADDR.rpartition(":")
     port = int(port)
-    server = ThreadingHTTPServer((host, port), HookHandler)
+    httpd = ThreadingHTTPServer((host, port), HookHandler)
     print(f"INFO teams-notifier listening on {LISTEN_ADDR}", flush=True)
     try:
-        server.serve_forever()
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        server.shutdown()
+        httpd.shutdown()
+        stop_workers()
 
 
 if __name__ == "__main__":

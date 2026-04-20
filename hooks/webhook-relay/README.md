@@ -28,6 +28,8 @@ Use this when you need to push events to monitoring systems, CMDBs, incident man
 | `RELAY_MAX_RETRIES` | No | Max delivery attempts per destination (default: `3`) |
 | `RELAY_INITIAL_BACKOFF` | No | Initial retry backoff in seconds (default: `1.0`) |
 | `RELAY_REQUEST_TIMEOUT` | No | HTTP request timeout in seconds (default: `5`) |
+| `RELAY_WORKER_COUNT` | No | Number of worker threads for async delivery (default: `8`) |
+| `RELAY_QUEUE_SIZE` | No | Max queued deliveries before dropping (default: `1000`) |
 | `LISTEN_ADDR` | No | Listen address (default: `:8080`) |
 
 ### Destination format

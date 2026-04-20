@@ -3,10 +3,12 @@ import hashlib
 import hmac
 import http.client
 import json
+import queue
 import threading
+import time
 import unittest
 from http.server import HTTPServer
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import server
 
@@ -103,6 +105,70 @@ class TestBuildAdaptiveCard(unittest.TestCase):
             self.assertTrue(url.startswith("https://my.host/"))
 
 
+class TestEnqueueCard(unittest.TestCase):
+    def test_enqueue_returns_true(self):
+        q = queue.Queue(maxsize=10)
+        with patch.object(server, "_work_queue", q):
+            self.assertTrue(server.enqueue_card({"type": "message"}))
+        self.assertEqual(q.qsize(), 1)
+
+    def test_enqueue_full_queue_returns_false(self):
+        q = queue.Queue(maxsize=1)
+        q.put("filler")
+        with patch.object(server, "_work_queue", q):
+            self.assertFalse(server.enqueue_card({"type": "message"}))
+
+    def test_dropped_counter_increments(self):
+        q = queue.Queue(maxsize=1)
+        q.put("filler")
+        original_dropped = server.get_dropped_count()
+        with patch.object(server, "_work_queue", q):
+            server.enqueue_card({"type": "message"})
+        self.assertEqual(server.get_dropped_count(), original_dropped + 1)
+
+
+class TestWorkerPool(unittest.TestCase):
+    def test_worker_processes_queued_item(self):
+        delivered = []
+        q = queue.Queue(maxsize=10)
+        card = {"type": "message", "test": True}
+        q.put(card)
+        q.put(None)
+
+        with patch.object(server, "_work_queue", q), \
+             patch.object(server, "post_to_teams", side_effect=lambda c: delivered.append(c)):
+            server._worker()
+
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["test"], True)
+
+    def test_worker_handles_exception(self):
+        q = queue.Queue(maxsize=10)
+        q.put({"type": "message"})
+        q.put(None)
+
+        with patch.object(server, "_work_queue", q), \
+             patch.object(server, "post_to_teams", side_effect=RuntimeError("boom")):
+            server._worker()
+
+        self.assertTrue(q.empty())
+
+    def test_start_and_stop_workers(self):
+        old_workers = server._workers.copy()
+        server._workers.clear()
+
+        q = queue.Queue(maxsize=100)
+        with patch.object(server, "_work_queue", q):
+            server.start_workers(count=2)
+            self.assertEqual(len(server._workers), 2)
+            for t in server._workers:
+                self.assertTrue(t.is_alive())
+            server.stop_workers()
+
+        self.assertEqual(len(server._workers), 0)
+        server._workers.extend(old_workers)
+
+
 class TestHTTPHandler(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -126,6 +192,8 @@ class TestHTTPHandler(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         body = json.loads(resp.read())
         self.assertEqual(body["status"], "ok")
+        self.assertIn("queue_depth", body)
+        self.assertIn("dropped", body)
         conn.close()
 
     def test_get_unknown_path_returns_404(self):
@@ -157,9 +225,10 @@ class TestHTTPHandler(unittest.TestCase):
             self.assertEqual(resp.status, 401)
             conn.close()
 
-    @patch.object(server, "post_to_teams")
+    @patch.object(server, "enqueue_card")
     @patch.object(server, "TEAMS_WEBHOOK_URL", "https://fake.teams/webhook")
-    def test_deploy_finalized_posts_to_teams(self, mock_post):
+    def test_deploy_finalized_enqueues_card(self, mock_enqueue):
+        mock_enqueue.return_value = True
         body = json.dumps(SAMPLE_ENVELOPE).encode()
         with patch.object(server, "SECRET", ""):
             conn = self._conn()
@@ -172,13 +241,13 @@ class TestHTTPHandler(unittest.TestCase):
             data = json.loads(resp.read())
             self.assertTrue(data["allowed"])
             conn.close()
-        mock_post.assert_called_once()
-        card = mock_post.call_args[0][0]
+        mock_enqueue.assert_called_once()
+        card = mock_enqueue.call_args[0][0]
         self.assertEqual(card["type"], "message")
 
-    @patch.object(server, "post_to_teams")
+    @patch.object(server, "enqueue_card")
     @patch.object(server, "TEAMS_WEBHOOK_URL", "https://fake.teams/webhook")
-    def test_non_deploy_event_does_not_post(self, mock_post):
+    def test_non_deploy_event_does_not_enqueue(self, mock_enqueue):
         env = {**SAMPLE_ENVELOPE, "event": "post-instance-create"}
         body = json.dumps(env).encode()
         with patch.object(server, "SECRET", ""):
@@ -190,11 +259,11 @@ class TestHTTPHandler(unittest.TestCase):
             resp = conn.getresponse()
             self.assertEqual(resp.status, 200)
             conn.close()
-        mock_post.assert_not_called()
+        mock_enqueue.assert_not_called()
 
-    @patch.object(server, "post_to_teams")
+    @patch.object(server, "enqueue_card")
     @patch.object(server, "TEAMS_WEBHOOK_URL", "")
-    def test_no_webhook_url_skips_post(self, mock_post):
+    def test_no_webhook_url_skips_enqueue(self, mock_enqueue):
         body = json.dumps(SAMPLE_ENVELOPE).encode()
         with patch.object(server, "SECRET", ""):
             conn = self._conn()
@@ -205,14 +274,14 @@ class TestHTTPHandler(unittest.TestCase):
             resp = conn.getresponse()
             self.assertEqual(resp.status, 200)
             conn.close()
-        mock_post.assert_not_called()
+        mock_enqueue.assert_not_called()
 
     def test_post_with_valid_hmac_succeeds(self):
         body = json.dumps(SAMPLE_ENVELOPE).encode()
         sig = _sign(body)
         with patch.object(server, "SECRET", TEST_SECRET), \
              patch.object(server, "TEAMS_WEBHOOK_URL", ""), \
-             patch.object(server, "post_to_teams"):
+             patch.object(server, "enqueue_card"):
             conn = self._conn()
             conn.request(
                 "POST", "/hook", body=body,

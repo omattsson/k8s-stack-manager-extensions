@@ -4,6 +4,9 @@
 Supports multiple destination URLs, configurable event filtering, custom headers,
 retry with exponential backoff, and a JSON-lines delivery log for debugging.
 
+Inbound requests are accepted immediately and deliveries are processed by a
+fixed-size worker pool, so thread count stays bounded under load.
+
 Usage:
     export RELAY_WEBHOOK_SECRET="your-shared-secret"
     export RELAY_DESTINATIONS='[{"url":"https://monitoring.example/hook","events":["deploy-finalized"],"headers":{"X-Source":"stack-manager"}}]'
@@ -14,6 +17,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import sys
 import time
 import threading
@@ -28,6 +32,8 @@ LOG_FILE = os.environ.get("RELAY_LOG_FILE", "")
 MAX_RETRIES = int(os.environ.get("RELAY_MAX_RETRIES", "3"))
 INITIAL_BACKOFF = float(os.environ.get("RELAY_INITIAL_BACKOFF", "1.0"))
 REQUEST_TIMEOUT = int(os.environ.get("RELAY_REQUEST_TIMEOUT", "5"))
+WORKER_COUNT = int(os.environ.get("RELAY_WORKER_COUNT", "8"))
+QUEUE_SIZE = int(os.environ.get("RELAY_QUEUE_SIZE", "1000"))
 
 
 def load_destinations():
@@ -49,6 +55,9 @@ def load_destinations():
 DESTINATIONS = load_destinations()
 
 _log_lock = threading.Lock()
+_work_queue = queue.Queue(maxsize=QUEUE_SIZE)
+_dropped = 0
+_dropped_lock = threading.Lock()
 
 
 def log_delivery(entry: dict) -> None:
@@ -143,22 +152,68 @@ def relay_to_destination(dest: dict, envelope: dict, raw_body: bytes, request_id
     })
 
 
-def dispatch(envelope: dict, raw_body: bytes, request_id: str) -> None:
+def _worker():
+    while True:
+        item = _work_queue.get()
+        if item is None:
+            break
+        dest, envelope, raw_body, request_id = item
+        try:
+            relay_to_destination(dest, envelope, raw_body, request_id)
+        except Exception as exc:
+            print(f"ERROR worker unhandled exception: {exc}", file=sys.stderr, flush=True)
+        finally:
+            _work_queue.task_done()
+
+
+def dispatch(envelope: dict, raw_body: bytes, request_id: str) -> int:
+    """Enqueue deliveries for matching destinations. Returns enqueued count."""
+    global _dropped
     event = envelope.get("event", "")
-    threads = []
+    enqueued = 0
     for dest in DESTINATIONS:
         allowed_events = dest.get("events", [])
         if allowed_events and event not in allowed_events:
             continue
-        t = threading.Thread(
-            target=relay_to_destination,
-            args=(dest, envelope, raw_body, request_id),
-            daemon=True,
-        )
+        try:
+            _work_queue.put_nowait((dest, envelope, raw_body, request_id))
+            enqueued += 1
+        except queue.Full:
+            with _dropped_lock:
+                _dropped += 1
+            print(
+                f"WARN queue full, dropped dest={dest['name']} request_id={request_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return enqueued
+
+
+_workers: list[threading.Thread] = []
+
+
+def start_workers(count: int = WORKER_COUNT) -> None:
+    for _ in range(count):
+        t = threading.Thread(target=_worker, daemon=True)
         t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=MAX_RETRIES * REQUEST_TIMEOUT + 30)
+        _workers.append(t)
+
+
+def stop_workers() -> None:
+    for _ in _workers:
+        _work_queue.put(None)
+    for t in _workers:
+        t.join(timeout=10)
+    _workers.clear()
+
+
+def get_queue_depth() -> int:
+    return _work_queue.qsize()
+
+
+def get_dropped_count() -> int:
+    with _dropped_lock:
+        return _dropped
 
 
 class HookHandler(BaseHTTPRequestHandler):
@@ -167,8 +222,13 @@ class HookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            dest_count = len(DESTINATIONS)
-            self.wfile.write(json.dumps({"status": "ok", "destinations": dest_count}).encode())
+            body = {
+                "status": "ok",
+                "destinations": len(DESTINATIONS),
+                "queue_depth": get_queue_depth(),
+                "dropped": get_dropped_count(),
+            }
+            self.wfile.write(json.dumps(body).encode())
             return
         self.send_response(404)
         self.end_headers()
@@ -217,16 +277,22 @@ def main():
         sys.exit(1)
 
     names = [d["name"] for d in DESTINATIONS]
-    print(f"INFO webhook-relay destinations={names}", flush=True)
+    print(
+        f"INFO webhook-relay destinations={names} workers={WORKER_COUNT} queue_size={QUEUE_SIZE}",
+        flush=True,
+    )
+
+    start_workers()
 
     host, _, port = LISTEN_ADDR.rpartition(":")
     port = int(port)
-    server = ThreadingHTTPServer((host, port), HookHandler)
+    httpd = ThreadingHTTPServer((host, port), HookHandler)
     print(f"INFO webhook-relay listening on {LISTEN_ADDR}", flush=True)
     try:
-        server.serve_forever()
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        server.shutdown()
+        httpd.shutdown()
+        stop_workers()
 
 
 if __name__ == "__main__":

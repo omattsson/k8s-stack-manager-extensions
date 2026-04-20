@@ -23,6 +23,8 @@ Only `deploy-finalized` events trigger a Teams message (covers both success and 
 | `TEAMS_WEBHOOK_URL` | Yes | Microsoft Teams Incoming Webhook URL |
 | `TEAMS_WEBHOOK_SECRET` | Yes | HMAC secret shared with k8s-stack-manager |
 | `STACK_MANAGER_URL` | No | Base URL for links in messages (default: `https://stack-manager.example`) |
+| `TEAMS_WORKER_COUNT` | No | Number of worker threads for async delivery (default: `4`) |
+| `TEAMS_QUEUE_SIZE` | No | Max queued notifications before dropping (default: `500`) |
 | `LISTEN_ADDR` | No | Listen address (default: `:8080`) |
 
 ### hooks-config.json snippet
