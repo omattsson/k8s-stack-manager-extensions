@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: extensions
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: teams-notifier
+  namespace: extensions
+type: Opaque
+stringData:
+  TEAMS_WEBHOOK_URL: "https://your-tenant.webhook.office.com/webhookb2/REPLACE_ME"
+  TEAMS_WEBHOOK_SECRET: "REPLACE_ME"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teams-notifier
+  namespace: extensions
+  labels:
+    app: teams-notifier
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teams-notifier
+  template:
+    metadata:
+      labels:
+        app: teams-notifier
+    spec:
+      containers:
+        - name: teams-notifier
+          image: teams-notifier:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: teams-notifier
+          env:
+            - name: STACK_MANAGER_URL
+              value: "https://stack-manager.example"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teams-notifier
+  namespace: extensions
+spec:
+  selector:
+    app: teams-notifier
+  ports:
+    - port: 8080
+      targetPort: 8080

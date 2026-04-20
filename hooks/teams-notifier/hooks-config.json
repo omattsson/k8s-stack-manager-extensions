@@ -1,0 +1,12 @@
+{
+  "subscriptions": [
+    {
+      "name": "teams-notifier",
+      "events": ["deploy-finalized"],
+      "url": "http://teams-notifier.extensions.svc.cluster.local:8080/hook",
+      "timeout_seconds": 10,
+      "failure_policy": "ignore",
+      "secret_env": "TEAMS_WEBHOOK_SECRET"
+    }
+  ]
+}
