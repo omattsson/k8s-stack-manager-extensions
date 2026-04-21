@@ -119,6 +119,8 @@ def relay_to_destination(dest: dict, envelope: dict, raw_body: bytes, request_id
         except urllib.error.HTTPError as exc:
             status_code = exc.code
             last_error = f"HTTP {exc.code}"
+            if 400 <= exc.code < 500 and exc.code != 429:
+                break
         except urllib.error.URLError as exc:
             last_error = str(exc.reason)
         except OSError as exc:
@@ -275,6 +277,8 @@ def main():
     if not DESTINATIONS:
         print("FATAL RELAY_DESTINATIONS is empty", file=sys.stderr, flush=True)
         sys.exit(1)
+    if not SECRET:
+        print("WARN RELAY_WEBHOOK_SECRET not set -- signature verification disabled", file=sys.stderr, flush=True)
 
     names = [d["name"] for d in DESTINATIONS]
     print(

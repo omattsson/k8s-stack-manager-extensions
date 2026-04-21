@@ -235,6 +235,8 @@ def main():
     if not TEAMS_WEBHOOK_URL:
         print("FATAL TEAMS_WEBHOOK_URL is required", file=sys.stderr, flush=True)
         sys.exit(1)
+    if not SECRET:
+        print("WARN TEAMS_WEBHOOK_SECRET not set -- signature verification disabled", file=sys.stderr, flush=True)
 
     print(
         f"INFO teams-notifier workers={WORKER_COUNT} queue_size={QUEUE_SIZE}",

@@ -78,6 +78,7 @@ spec:
               memory: 64Mi
           securityContext:
             runAsNonRoot: true
+            readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
       volumes:
         - name: log-vol

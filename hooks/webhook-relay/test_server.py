@@ -74,6 +74,19 @@ class _FailHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ForbiddenHandler(BaseHTTPRequestHandler):
+    call_count = 0
+
+    def do_POST(self):
+        self.__class__.call_count += 1
+        self.send_response(403)
+        self.end_headers()
+        self.wfile.write(b'{"error":"forbidden"}')
+
+    def log_message(self, *args):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — pure functions
 # ---------------------------------------------------------------------------
@@ -222,6 +235,29 @@ class TestRelayRetry(unittest.TestCase):
             server.relay_to_destination(dest, SAMPLE_ENVELOPE, body, "req-retry")
 
         self.assertEqual(_FailHandler.call_count, 3)
+
+    def test_no_retry_on_4xx(self):
+        _ForbiddenHandler.call_count = 0
+        forbidden_server = HTTPServer(("127.0.0.1", 0), _ForbiddenHandler)
+        forbidden_port = forbidden_server.server_address[1]
+        forbidden_thread = threading.Thread(target=forbidden_server.serve_forever, daemon=True)
+        forbidden_thread.start()
+        try:
+            dest = {
+                "name": "forbidden-dest",
+                "url": f"http://127.0.0.1:{forbidden_port}/hook",
+                "headers": {},
+                "events": [],
+            }
+            body = json.dumps(SAMPLE_ENVELOPE).encode()
+            with patch.object(server, "LOG_FILE", ""), \
+                 patch.object(server, "MAX_RETRIES", 3), \
+                 patch.object(server, "INITIAL_BACKOFF", 0.01):
+                server.relay_to_destination(dest, SAMPLE_ENVELOPE, body, "req-403")
+            self.assertEqual(_ForbiddenHandler.call_count, 1)
+        finally:
+            forbidden_server.shutdown()
+            forbidden_thread.join(timeout=5)
 
     def test_logs_failure_after_exhausting_retries(self):
         dest = {
