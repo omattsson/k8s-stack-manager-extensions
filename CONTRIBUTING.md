@@ -27,7 +27,7 @@ Thank you for your interest in contributing!
 ## General Guidelines
 - Follow the conventions in [AGENTS.md](AGENTS.md).
 - All hooks must be stateless, secure, and expose `/healthz`.
-- No external dependencies except for `requests` in Python hooks.
+- No external dependencies in Python hooks (stdlib only).
 - Use environment variables for secrets and configuration.
 
 For more details, see the documentation in each hook directory and [AGENTS.md](AGENTS.md).
