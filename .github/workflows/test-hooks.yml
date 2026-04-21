@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        hook: [maintenance-gate, slack-notifier]
+        hook: [maintenance-gate, slack-notifier, teams-notifier, webhook-relay]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python

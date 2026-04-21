@@ -1,0 +1,12 @@
+{
+  "subscriptions": [
+    {
+      "name": "webhook-relay",
+      "events": ["deploy-finalized", "post-instance-create", "post-instance-delete"],
+      "url": "http://webhook-relay.extensions.svc.cluster.local:8080/hook",
+      "timeout_seconds": 10,
+      "failure_policy": "ignore",
+      "secret_env": "RELAY_WEBHOOK_SECRET"
+    }
+  ]
+}
