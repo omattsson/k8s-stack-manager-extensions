@@ -15,6 +15,9 @@ spec:
         {{- include "teams-notifier.selectorLabels" . | nindent 8 }}
       annotations:
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- if .Values.cardTemplate }}
+        checksum/card-template: {{ .Values.cardTemplate | sha256sum }}
+        {{- end }}
     spec:
       containers:
         - name: teams-notifier
@@ -34,6 +37,10 @@ spec:
               value: {{ .Values.workers | quote }}
             - name: TEAMS_QUEUE_SIZE
               value: {{ .Values.queueSize | quote }}
+            {{- if .Values.cardTemplate }}
+            - name: CARD_TEMPLATE_FILE
+              value: /config/card-template.json
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -46,9 +53,21 @@ spec:
               port: http
             initialDelaySeconds: 3
             periodSeconds: 5
+          {{- if .Values.cardTemplate }}
+          volumeMounts:
+            - name: card-template
+              mountPath: /config
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
             runAsNonRoot: true
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
+      {{- if .Values.cardTemplate }}
+      volumes:
+        - name: card-template
+          configMap:
+            name: {{ include "teams-notifier.fullname" . }}-card-template
+      {{- end }}
