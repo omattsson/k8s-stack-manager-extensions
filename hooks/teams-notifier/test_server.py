@@ -105,6 +105,60 @@ class TestBuildAdaptiveCard(unittest.TestCase):
             self.assertTrue(url.startswith("https://my.host/"))
 
 
+class TestCustomCardTemplate(unittest.TestCase):
+    TEMPLATE = json.dumps({
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": [{"type": "TextBlock", "text": "{{emoji}} {{outcome}} — {{name}}"}],
+                "actions": [
+                    {"type": "Action.OpenUrl", "title": "Site", "url": "http://{{name}}.localhost"},
+                    {"type": "Action.OpenUrl", "title": "Manager", "url": "{{instance_url}}"},
+                ],
+            },
+        }],
+    })
+
+    def test_render_custom_card_success(self):
+        card = server.render_custom_card(self.TEMPLATE, SAMPLE_ENVELOPE)
+        text = card["attachments"][0]["content"]["body"][0]["text"]
+        self.assertIn("succeeded", text)
+        self.assertIn("demo", text)
+        actions = card["attachments"][0]["content"]["actions"]
+        self.assertEqual(actions[0]["url"], "http://demo.localhost")
+        self.assertIn("inst-001", actions[1]["url"])
+
+    def test_render_custom_card_failure(self):
+        env = {**SAMPLE_ENVELOPE, "instance": {**SAMPLE_ENVELOPE["instance"], "status": "error"}}
+        card = server.render_custom_card(self.TEMPLATE, env)
+        text = card["attachments"][0]["content"]["body"][0]["text"]
+        self.assertIn("failed", text)
+
+    def test_build_uses_custom_template_when_set(self):
+        with patch.object(server, "_card_template", self.TEMPLATE):
+            card = server.build_adaptive_card(SAMPLE_ENVELOPE)
+            actions = card["attachments"][0]["content"]["actions"]
+            self.assertEqual(len(actions), 2)
+            self.assertEqual(actions[0]["title"], "Site")
+
+    def test_build_uses_default_when_no_template(self):
+        with patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(SAMPLE_ENVELOPE)
+            actions = card["attachments"][0]["content"]["actions"]
+            self.assertEqual(actions[0]["title"], "View instance")
+
+    def test_load_card_template_returns_none_when_not_set(self):
+        with patch.object(server, "CARD_TEMPLATE_FILE", ""):
+            self.assertIsNone(server.load_card_template())
+
+    def test_load_card_template_returns_none_on_missing_file(self):
+        with patch.object(server, "CARD_TEMPLATE_FILE", "/nonexistent/card.json"):
+            self.assertIsNone(server.load_card_template())
+
+
 class TestEnqueueCard(unittest.TestCase):
     def test_enqueue_returns_true(self):
         q = queue.Queue(maxsize=10)

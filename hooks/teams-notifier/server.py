@@ -27,13 +27,58 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
 SECRET = os.environ.get("TEAMS_WEBHOOK_SECRET", "")
 STACK_MANAGER_URL = os.environ.get("STACK_MANAGER_URL", "https://stack-manager.example")
+CARD_TEMPLATE_FILE = os.environ.get("CARD_TEMPLATE_FILE", "")
 LISTEN_ADDR = os.environ.get("LISTEN_ADDR", ":8080")
 WORKER_COUNT = int(os.environ.get("TEAMS_WORKER_COUNT", "4"))
 QUEUE_SIZE = int(os.environ.get("TEAMS_QUEUE_SIZE", "500"))
 
+_card_template: str | None = None
+
 _work_queue = queue.Queue(maxsize=QUEUE_SIZE)
 _dropped = 0
 _dropped_lock = threading.Lock()
+
+
+def load_card_template() -> str | None:
+    if not CARD_TEMPLATE_FILE:
+        return None
+    try:
+        with open(CARD_TEMPLATE_FILE) as f:
+            return f.read()
+    except OSError as exc:
+        print(f"WARN failed to load card template {CARD_TEMPLATE_FILE}: {exc}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+def render_custom_card(template: str, envelope: dict) -> dict:
+    """Render a custom Adaptive Card template with variable substitution.
+
+    Supported variables (all wrapped in {{...}}):
+        name, namespace, branch, cluster_id, status, instance_id,
+        instance_url, outcome, emoji
+    """
+    instance = envelope.get("instance", {})
+    name = instance.get("name", "unknown")
+    status = instance.get("status", "")
+    instance_id = instance.get("id", "")
+    is_success = status in ("deployed", "running")
+
+    variables = {
+        "name": name,
+        "namespace": instance.get("namespace", "unknown"),
+        "branch": instance.get("branch", "unknown"),
+        "cluster_id": instance.get("cluster_id", ""),
+        "status": status,
+        "instance_id": instance_id,
+        "instance_url": f"{STACK_MANAGER_URL}/stack-instances/{instance_id}",
+        "outcome": "succeeded" if is_success else "failed",
+        "emoji": "\u2705" if is_success else "\u274C",
+    }
+    rendered = template
+    for key, value in variables.items():
+        rendered = rendered.replace("{{" + key + "}}", value)
+    return json.loads(rendered)
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -46,6 +91,9 @@ def verify_signature(body: bytes, signature: str) -> bool:
 
 
 def build_adaptive_card(envelope: dict) -> dict:
+    if _card_template is not None:
+        return render_custom_card(_card_template, envelope)
+
     instance = envelope.get("instance", {})
     name = instance.get("name", "unknown")
     namespace = instance.get("namespace", "unknown")
@@ -232,11 +280,17 @@ class HookHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    global _card_template
+
     if not TEAMS_WEBHOOK_URL:
         print("FATAL TEAMS_WEBHOOK_URL is required", file=sys.stderr, flush=True)
         sys.exit(1)
     if not SECRET:
         print("WARN TEAMS_WEBHOOK_SECRET not set -- signature verification disabled", file=sys.stderr, flush=True)
+
+    _card_template = load_card_template()
+    if _card_template:
+        print(f"INFO using custom card template from {CARD_TEMPLATE_FILE}", flush=True)
 
     print(
         f"INFO teams-notifier workers={WORKER_COUNT} queue_size={QUEUE_SIZE}",

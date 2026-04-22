@@ -1,0 +1,25 @@
+{{- if .Values.hooksConfig.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.hooksConfig.name }}
+  namespace: {{ .Values.hooksConfig.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "teams-notifier.labels" . | nindent 4 }}
+  annotations:
+    config.kubernetes.io/description: "Hook subscription config for k8s-stack-manager — mount this as HOOKS_CONFIG_FILE"
+data:
+  hooks.json: |
+    {
+      "subscriptions": [
+        {
+          "name": "teams-notifier",
+          "events": ["deploy-finalized"],
+          "url": "{{ include "teams-notifier.serviceUrl" . }}/hook",
+          "timeout_seconds": {{ .Values.hooksConfig.timeoutSeconds }},
+          "failure_policy": {{ .Values.hooksConfig.failurePolicy | quote }},
+          "secret_env": "TEAMS_NOTIFIER_HOOK_SECRET"
+        }
+      ]
+    }
+{{- end }}
