@@ -58,6 +58,7 @@ type ChartRef struct {
 	Version         string `json:"version,omitempty"`
 	SourceRepoURL   string `json:"source_repo_url,omitempty"`
 	BuildPipelineID string `json:"build_pipeline_id,omitempty"`
+	Branch          string `json:"branch,omitempty"`
 }
 
 type HookResponse struct {
@@ -552,26 +553,29 @@ func (h *handler) hookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	branch := env.Instance.Branch
-	if branch == "" {
-		logLine("No branch in envelope, allowing deploy")
-		respond(HookResponse{Allowed: true, Message: "no branch specified"})
-		return
-	}
-
-	tag := sanitizeBranch(branch)
-	if tag == "" {
-		logLine("Branch %q sanitized to empty tag, allowing deploy", branch)
-		respond(HookResponse{Allowed: true, Message: "branch produced empty image tag"})
-		return
-	}
+	defaultBranch := env.Instance.Branch
 
 	var jobs []buildJob
 
 	for _, chart := range env.Charts {
+		branch := chart.Branch
+		if branch == "" {
+			branch = defaultBranch
+		}
+		if branch == "" {
+			continue
+		}
+
 		if shouldSkipChart(chart, branch) {
 			continue
 		}
+
+		tag := sanitizeBranch(branch)
+		if tag == "" {
+			logLine("Branch %q sanitized to empty tag, skipping %s", branch, chart.Name)
+			continue
+		}
+
 		repo := chart.Name
 		logLine("Checking image %s:%s...", repo, tag)
 
