@@ -637,6 +637,45 @@ func TestHandleHook_MultipleCharts(t *testing.T) {
 	}
 }
 
+func TestHandleHook_ImageRepoPrefix(t *testing.T) {
+	origSecret := secret
+	origPrefix := imageRepoPrefix
+	secret = ""
+	imageRepoPrefix = "dev"
+	defer func() { secret = origSecret; imageRepoPrefix = origPrefix }()
+
+	reg := newMockRegistry()
+	reg.setImage("dev/app-api", "feature-pfx", true)
+	ci := newMockCI()
+
+	h := &handler{
+		registry: reg,
+		ci:       ci,
+		cache:    newImageCache(5 * time.Minute),
+		poll:     50 * time.Millisecond,
+	}
+
+	charts := []ChartRef{{Name: "app-api", BuildPipelineID: "42"}}
+	body, _ := json.Marshal(makeEnvelope("feature/pfx", charts))
+	rr := postHook(t, h.hookHandler, body, "")
+
+	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
+	lastLine := lines[len(lines)-1]
+	var resp HookResponse
+	json.Unmarshal([]byte(lastLine), &resp)
+	if !resp.Allowed {
+		t.Fatalf("expected allowed=true, got %+v", resp)
+	}
+
+	bodyStr := rr.Body.String()
+	if !strings.Contains(bodyStr, "dev/app-api") {
+		t.Fatal("expected LOG to reference dev/app-api (prefixed repo)")
+	}
+	if !strings.Contains(bodyStr, "found in registry") {
+		t.Fatal("expected image found in registry with prefixed path")
+	}
+}
+
 func newTestADOProvider(t *testing.T, handler http.Handler) *adoProvider {
 	t.Helper()
 	srv := httptest.NewServer(handler)

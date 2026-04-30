@@ -79,6 +79,7 @@ var (
 	registryURL      string
 	registryUsername string
 	registryPassword string
+	imageRepoPrefix  string
 
 	adoOrg     string
 	adoProject string
@@ -99,6 +100,7 @@ func initConfig() {
 	registryURL = os.Getenv("REGISTRY_URL")
 	registryUsername = os.Getenv("REGISTRY_USERNAME")
 	registryPassword = os.Getenv("REGISTRY_PASSWORD")
+	imageRepoPrefix = strings.TrimRight(os.Getenv("IMAGE_REPO_PREFIX"), "/")
 	adoOrg = os.Getenv("ADO_ORG")
 	adoProject = os.Getenv("ADO_PROJECT")
 	adoPAT = os.Getenv("ADO_PAT")
@@ -577,6 +579,9 @@ func (h *handler) hookHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		repo := chart.Name
+		if imageRepoPrefix != "" {
+			repo = imageRepoPrefix + "/" + chart.Name
+		}
 		logLine("Checking image %s:%s...", repo, tag)
 
 		if h.cache.isVerified(repo, tag) {
