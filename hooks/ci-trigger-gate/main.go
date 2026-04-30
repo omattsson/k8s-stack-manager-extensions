@@ -312,7 +312,7 @@ func (r *acrRegistry) exchangeToken(ctx context.Context, repo string) (string, e
 
 type ciProvider interface {
 	findRunningBuild(ctx context.Context, pipelineID, branch string) (string, error)
-	triggerBuild(ctx context.Context, pipelineID, branch string) (string, error)
+	triggerBuild(ctx context.Context, pipelineID, branch, imageTag string) (string, error)
 	getBuildStatus(ctx context.Context, buildID string) (status string, result string, err error)
 }
 
@@ -368,7 +368,7 @@ func (a *adoProvider) findRunningBuild(ctx context.Context, pipelineID, branch s
 	return strconv.Itoa(result.Value[0].ID), nil
 }
 
-func (a *adoProvider) triggerBuild(ctx context.Context, pipelineID, branch string) (string, error) {
+func (a *adoProvider) triggerBuild(ctx context.Context, pipelineID, branch, imageTag string) (string, error) {
 	defID, err := strconv.Atoi(pipelineID)
 	if err != nil {
 		return "", fmt.Errorf("invalid pipeline ID %q: %w", pipelineID, err)
@@ -378,9 +378,14 @@ func (a *adoProvider) triggerBuild(ctx context.Context, pipelineID, branch strin
 		Definition struct {
 			ID int `json:"id"`
 		} `json:"definition"`
-		SourceBranch string `json:"sourceBranch"`
+		SourceBranch       string            `json:"sourceBranch"`
+		TemplateParameters map[string]string `json:"templateParameters,omitempty"`
 	}{
-		SourceBranch: "refs/heads/" + branch,
+		SourceBranch: "refs/heads/main",
+		TemplateParameters: map[string]string{
+			"branch":   branch,
+			"imageTag": imageTag,
+		},
 	}
 	body.Definition.ID = defID
 
@@ -597,7 +602,7 @@ func (h *handler) hookHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		logLine("Triggering build for %s (pipeline %s, branch %s)...", repo, chart.BuildPipelineID, branch)
-		buildID, err := h.ci.triggerBuild(r.Context(), chart.BuildPipelineID, branch)
+		buildID, err := h.ci.triggerBuild(r.Context(), chart.BuildPipelineID, branch, tag)
 		if err != nil {
 			logLine("ERROR: failed to trigger build for %s: %v", repo, err)
 			respond(HookResponse{

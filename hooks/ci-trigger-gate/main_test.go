@@ -82,7 +82,7 @@ func (m *mockCI) findRunningBuild(_ context.Context, pipelineID, branch string) 
 	return id, nil
 }
 
-func (m *mockCI) triggerBuild(_ context.Context, pipelineID, branch string) (string, error) {
+func (m *mockCI) triggerBuild(_ context.Context, pipelineID, branch, imageTag string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.triggeredCount++
@@ -706,7 +706,7 @@ func TestADOProvider_TriggerBuild(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"id": 456})
 	}))
 
-	id, err := p.triggerBuild(context.Background(), "42", "feature/bar")
+	id, err := p.triggerBuild(context.Background(), "42", "feature/bar", "feature-bar")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -721,8 +721,18 @@ func TestADOProvider_TriggerBuild(t *testing.T) {
 	if defID, _ := def["id"].(float64); defID != 42 {
 		t.Fatalf("expected definition.id=42, got %v", defID)
 	}
-	if sb, _ := receivedBody["sourceBranch"].(string); sb != "refs/heads/feature/bar" {
-		t.Fatalf("expected sourceBranch=refs/heads/feature/bar, got %s", sb)
+	if sb, _ := receivedBody["sourceBranch"].(string); sb != "refs/heads/main" {
+		t.Fatalf("expected sourceBranch=refs/heads/main, got %s", sb)
+	}
+	tp, _ := receivedBody["templateParameters"].(map[string]any)
+	if tp == nil {
+		t.Fatal("missing templateParameters in request body")
+	}
+	if tp["branch"] != "feature/bar" {
+		t.Fatalf("expected templateParameters.branch=feature/bar, got %v", tp["branch"])
+	}
+	if tp["imageTag"] != "feature-bar" {
+		t.Fatalf("expected templateParameters.imageTag=feature-bar, got %v", tp["imageTag"])
 	}
 }
 
@@ -731,7 +741,7 @@ func TestADOProvider_TriggerBuild_InvalidPipelineID(t *testing.T) {
 		t.Fatal("should not have made a request")
 	}))
 
-	_, err := p.triggerBuild(context.Background(), "not-a-number", "main")
+	_, err := p.triggerBuild(context.Background(), "not-a-number", "main", "main")
 	if err == nil {
 		t.Fatal("expected error for non-numeric pipeline ID")
 	}
