@@ -1,0 +1,6 @@
+apiVersion: v2
+name: teams-notifier
+description: Posts deploy notifications to Microsoft Teams via Adaptive Cards
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

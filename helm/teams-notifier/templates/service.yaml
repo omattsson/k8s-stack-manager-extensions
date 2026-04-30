@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "teams-notifier.fullname" . }}
+  labels:
+    {{- include "teams-notifier.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "teams-notifier.selectorLabels" . | nindent 4 }}
+  ports:
+    - port: {{ .Values.port }}
+      targetPort: http
+      protocol: TCP
+      name: http

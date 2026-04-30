@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "teams-notifier.fullname" . }}
+  labels:
+    {{- include "teams-notifier.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "teams-notifier.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "teams-notifier.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- if .Values.cardTemplate }}
+        checksum/card-template: {{ .Values.cardTemplate | sha256sum }}
+        {{- end }}
+    spec:
+      containers:
+        - name: teams-notifier
+          image: {{ include "teams-notifier.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: {{ include "teams-notifier.fullname" . }}
+          env:
+            - name: STACK_MANAGER_URL
+              value: {{ .Values.stackManagerUrl | quote }}
+            - name: TEAMS_WORKER_COUNT
+              value: {{ .Values.workers | quote }}
+            - name: TEAMS_QUEUE_SIZE
+              value: {{ .Values.queueSize | quote }}
+            {{- if .Values.cardTemplate }}
+            - name: CARD_TEMPLATE_FILE
+              value: /config/card-template.json
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          {{- if .Values.cardTemplate }}
+          volumeMounts:
+            - name: card-template
+              mountPath: /config
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      {{- if .Values.cardTemplate }}
+      volumes:
+        - name: card-template
+          configMap:
+            name: {{ include "teams-notifier.fullname" . }}-card-template
+      {{- end }}

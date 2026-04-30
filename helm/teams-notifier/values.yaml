@@ -1,0 +1,51 @@
+image:
+  repository: ghcr.io/omattsson/k8s-stack-manager-extensions/teams-notifier
+  tag: ""  # Empty = uses Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+replicas: 1
+port: 8080
+
+# Required: Microsoft Teams Incoming Webhook URL
+teamsWebhookUrl: ""
+
+# HMAC shared secret for verifying requests from k8s-stack-manager.
+# Must match the secret configured in the stack-manager hooks config.
+# When empty, signature verification is disabled (not recommended).
+webhookSecret: ""
+
+# URL of the k8s-stack-manager UI — used in the "View instance" button
+stackManagerUrl: "https://stack-manager.example"
+
+# Custom Adaptive Card template (JSON). When set, replaces the default card.
+# Supports {{name}}, {{namespace}}, {{branch}}, {{status}}, {{instance_id}},
+# {{instance_url}}, {{outcome}}, {{emoji}}, {{cluster_id}} variables.
+# Example: see README.md
+cardTemplate: ""
+
+# Worker pool tuning
+workers: 4
+queueSize: 500
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 64Mi
+
+# ---------------------------------------------------------------------------
+# Hooks ConfigMap — generates the JSON config that k8s-stack-manager reads.
+# After installing this chart, mount this ConfigMap into the stack-manager
+# backend pod and set HOOKS_CONFIG_FILE to the mount path.
+# ---------------------------------------------------------------------------
+hooksConfig:
+  enabled: true
+  # Name of the generated ConfigMap
+  name: hooks-config-teams-notifier
+  # Namespace where the ConfigMap is created. Defaults to release namespace.
+  # Set this to the k8s-stack-manager namespace if it differs.
+  namespace: ""
+  # Hook subscription settings
+  timeoutSeconds: 10
+  failurePolicy: ignore

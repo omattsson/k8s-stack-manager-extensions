@@ -1,0 +1,42 @@
+teams-notifier deployed to namespace {{ .Release.Namespace }}.
+
+Service URL: {{ include "teams-notifier.serviceUrl" . }}
+Health check: {{ include "teams-notifier.serviceUrl" . }}/healthz
+
+{{- if .Values.hooksConfig.enabled }}
+
+A hooks ConfigMap "{{ .Values.hooksConfig.name }}" was created in namespace
+"{{ .Values.hooksConfig.namespace | default .Release.Namespace }}".
+
+To wire it into k8s-stack-manager, add the following to your backend values:
+
+  1. Mount the ConfigMap volume and set the env var:
+
+     backend:
+       env:
+         HOOKS_CONFIG_FILE: /etc/hooks/hooks.json
+       secrets:
+         TEAMS_NOTIFIER_HOOK_SECRET: "{{ .Values.webhookSecret }}"
+
+  2. Add volume and volumeMount to the backend deployment/rollout:
+
+     volumeMounts:
+       - name: hooks-config
+         mountPath: /etc/hooks
+         readOnly: true
+
+     volumes:
+       - name: hooks-config
+         configMap:
+           name: {{ .Values.hooksConfig.name }}
+
+  3. Upgrade k8s-stack-manager:
+
+     helm upgrade k8s-stack-manager ./helm/k8s-stack-manager -f your-values.yaml
+{{- end }}
+
+{{- if not .Values.webhookSecret }}
+
+WARNING: webhookSecret is empty — HMAC signature verification is disabled.
+Set webhookSecret for production use.
+{{- end }}
