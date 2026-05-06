@@ -7,9 +7,15 @@ a formatted Adaptive Card message with instance details.
 Inbound requests are accepted immediately and Teams posts are processed by a
 fixed-size worker pool, so thread count stays bounded under load.
 
+Card rendering uses a JSON template file (CARD_TEMPLATE_FILE) with
+{{variable}} placeholders. When no template is configured, falls back to
+a built-in Adaptive Card.
+
 Usage:
     export TEAMS_WEBHOOK_URL="https://your-tenant.webhook.office.com/webhookb2/..."
     export TEAMS_WEBHOOK_SECRET="your-shared-secret"
+    export SITE_DOMAIN="klaravik.test"          # optional, used in card template
+    export CARD_TEMPLATE_FILE="/config/card.json" # optional, path to card template
     python3 server.py
 """
 
@@ -18,6 +24,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import sys
 import urllib.request
 import urllib.error
@@ -27,16 +34,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
 SECRET = os.environ.get("TEAMS_WEBHOOK_SECRET", "")
 STACK_MANAGER_URL = os.environ.get("STACK_MANAGER_URL", "https://stack-manager.example")
+SITE_DOMAIN = os.environ.get("SITE_DOMAIN", "localhost")
 CARD_TEMPLATE_FILE = os.environ.get("CARD_TEMPLATE_FILE", "")
 LISTEN_ADDR = os.environ.get("LISTEN_ADDR", ":8080")
 WORKER_COUNT = int(os.environ.get("TEAMS_WORKER_COUNT", "4"))
 QUEUE_SIZE = int(os.environ.get("TEAMS_QUEUE_SIZE", "500"))
 
-_card_template: str | None = None
-
 _work_queue = queue.Queue(maxsize=QUEUE_SIZE)
 _dropped = 0
 _dropped_lock = threading.Lock()
+
+_card_template: str | None = None
 
 
 def load_card_template() -> str | None:
@@ -45,40 +53,43 @@ def load_card_template() -> str | None:
     try:
         with open(CARD_TEMPLATE_FILE) as f:
             return f.read()
-    except OSError as exc:
-        print(f"WARN failed to load card template {CARD_TEMPLATE_FILE}: {exc}",
-              file=sys.stderr, flush=True)
+    except FileNotFoundError:
+        print(f"WARN card template not found: {CARD_TEMPLATE_FILE}", file=sys.stderr, flush=True)
         return None
 
 
-def render_custom_card(template: str, envelope: dict) -> dict:
-    """Render a custom Adaptive Card template with variable substitution.
+def render_template(template: str, variables: dict[str, str]) -> dict:
+    rendered = re.sub(
+        r"\{\{(\w+)\}\}",
+        lambda m: variables.get(m.group(1), m.group(0)),
+        template,
+    )
+    return json.loads(rendered)
 
-    Supported variables (all wrapped in {{...}}):
-        name, namespace, branch, cluster_id, status, instance_id,
-        instance_url, outcome, emoji
-    """
+
+def build_template_variables(envelope: dict) -> dict[str, str]:
     instance = envelope.get("instance", {})
     name = instance.get("name", "unknown")
     status = instance.get("status", "")
     instance_id = instance.get("id", "")
+
     is_success = status in ("deployed", "running")
 
-    variables = {
+    return {
         "name": name,
         "namespace": instance.get("namespace", "unknown"),
         "branch": instance.get("branch", "unknown"),
         "cluster_id": instance.get("cluster_id", ""),
         "status": status,
         "instance_id": instance_id,
-        "instance_url": f"{STACK_MANAGER_URL}/stack-instances/{instance_id}",
+        "emoji": "✅" if is_success else "❌",
         "outcome": "succeeded" if is_success else "failed",
-        "emoji": "\u2705" if is_success else "\u274C",
+        "color": "good" if is_success else "attention",
+        "instance_url": f"{STACK_MANAGER_URL}/stack-instances/{instance_id}",
+        "site_url": f"https://{name}.{SITE_DOMAIN}",
+        "site_domain": SITE_DOMAIN,
+        "stack_manager_url": STACK_MANAGER_URL,
     }
-    rendered = template
-    for key, value in variables.items():
-        rendered = rendered.replace("{{" + key + "}}", value)
-    return json.loads(rendered)
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -91,8 +102,10 @@ def verify_signature(body: bytes, signature: str) -> bool:
 
 
 def build_adaptive_card(envelope: dict) -> dict:
+    global _card_template
     if _card_template is not None:
-        return render_custom_card(_card_template, envelope)
+        variables = build_template_variables(envelope)
+        return render_template(_card_template, variables)
 
     instance = envelope.get("instance", {})
     name = instance.get("name", "unknown")
@@ -103,11 +116,12 @@ def build_adaptive_card(envelope: dict) -> dict:
     instance_id = instance.get("id", "")
 
     is_success = status in ("deployed", "running")
-    emoji = "\u2705" if is_success else "\u274C"
+    emoji = "✅" if is_success else "❌"
     outcome = "succeeded" if is_success else "failed"
     color = "good" if is_success else "attention"
 
     instance_url = f"{STACK_MANAGER_URL}/stack-instances/{instance_id}"
+    site_url = f"https://{name}.{SITE_DOMAIN}"
 
     facts = [
         {"title": "Namespace", "value": namespace},
@@ -131,7 +145,7 @@ def build_adaptive_card(envelope: dict) -> dict:
                             "type": "TextBlock",
                             "size": "medium",
                             "weight": "bolder",
-                            "text": f"{emoji} Deploy {outcome} \u2014 {name}",
+                            "text": f"{emoji} Deploy {outcome} — {name}",
                             "style": "heading",
                             "color": color,
                         },
@@ -143,9 +157,14 @@ def build_adaptive_card(envelope: dict) -> dict:
                     "actions": [
                         {
                             "type": "Action.OpenUrl",
-                            "title": "View instance",
+                            "title": "Open site",
+                            "url": site_url,
+                        },
+                        {
+                            "type": "Action.OpenUrl",
+                            "title": "Stack Manager",
                             "url": instance_url,
-                        }
+                        },
                     ],
                 },
             }
@@ -290,10 +309,10 @@ def main():
 
     _card_template = load_card_template()
     if _card_template:
-        print(f"INFO using custom card template from {CARD_TEMPLATE_FILE}", flush=True)
+        print(f"INFO loaded card template from {CARD_TEMPLATE_FILE}", flush=True)
 
     print(
-        f"INFO teams-notifier workers={WORKER_COUNT} queue_size={QUEUE_SIZE}",
+        f"INFO teams-notifier workers={WORKER_COUNT} queue_size={QUEUE_SIZE} site_domain={SITE_DOMAIN}",
         flush=True,
     )
 

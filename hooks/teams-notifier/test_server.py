@@ -55,7 +55,8 @@ class TestVerifySignature(unittest.TestCase):
 
 class TestBuildAdaptiveCard(unittest.TestCase):
     def test_success_card(self):
-        card = server.build_adaptive_card(SAMPLE_ENVELOPE)
+        with patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(SAMPLE_ENVELOPE)
         self.assertEqual(card["type"], "message")
         attachments = card["attachments"]
         self.assertEqual(len(attachments), 1)
@@ -76,87 +77,168 @@ class TestBuildAdaptiveCard(unittest.TestCase):
         self.assertIn("Cluster", fact_titles)
 
         actions = content["actions"]
-        self.assertEqual(actions[0]["type"], "Action.OpenUrl")
-        self.assertIn("inst-001", actions[0]["url"])
+        self.assertEqual(actions[0]["title"], "Open site")
+        self.assertEqual(actions[1]["title"], "Stack Manager")
+        self.assertIn("inst-001", actions[1]["url"])
 
     def test_failure_card(self):
         env = {**SAMPLE_ENVELOPE, "instance": {**SAMPLE_ENVELOPE["instance"], "status": "error"}}
-        card = server.build_adaptive_card(env)
+        with patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(env)
         heading = card["attachments"][0]["content"]["body"][0]
         self.assertIn("failed", heading["text"])
         self.assertEqual(heading["color"], "attention")
 
     def test_no_cluster_omits_fact(self):
         env = {**SAMPLE_ENVELOPE, "instance": {**SAMPLE_ENVELOPE["instance"], "cluster_id": ""}}
-        card = server.build_adaptive_card(env)
+        with patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(env)
         facts = card["attachments"][0]["content"]["body"][1]["facts"]
         fact_titles = [f["title"] for f in facts]
         self.assertNotIn("Cluster", fact_titles)
 
     def test_missing_instance_uses_defaults(self):
-        card = server.build_adaptive_card({"event": "deploy-finalized"})
+        with patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card({"event": "deploy-finalized"})
         heading = card["attachments"][0]["content"]["body"][0]
         self.assertIn("unknown", heading["text"])
 
     def test_custom_stack_manager_url(self):
-        with patch.object(server, "STACK_MANAGER_URL", "https://my.host"):
+        with patch.object(server, "STACK_MANAGER_URL", "https://my.host"), \
+             patch.object(server, "_card_template", None):
             card = server.build_adaptive_card(SAMPLE_ENVELOPE)
-            url = card["attachments"][0]["content"]["actions"][0]["url"]
-            self.assertTrue(url.startswith("https://my.host/"))
+            sm_action = card["attachments"][0]["content"]["actions"][1]
+            self.assertTrue(sm_action["url"].startswith("https://my.host/"))
 
 
-class TestCustomCardTemplate(unittest.TestCase):
-    TEMPLATE = json.dumps({
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": {
-                "type": "AdaptiveCard",
-                "version": "1.4",
-                "body": [{"type": "TextBlock", "text": "{{emoji}} {{outcome}} — {{name}}"}],
-                "actions": [
-                    {"type": "Action.OpenUrl", "title": "Site", "url": "http://{{name}}.localhost"},
-                    {"type": "Action.OpenUrl", "title": "Manager", "url": "{{instance_url}}"},
-                ],
-            },
-        }],
-    })
+class TestSiteDomain(unittest.TestCase):
+    def test_fallback_card_uses_site_domain(self):
+        with patch.object(server, "SITE_DOMAIN", "klaravik.test"), \
+             patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(SAMPLE_ENVELOPE)
+            site_action = card["attachments"][0]["content"]["actions"][0]
+            self.assertEqual(site_action["url"], "https://demo.klaravik.test")
 
-    def test_render_custom_card_success(self):
-        card = server.render_custom_card(self.TEMPLATE, SAMPLE_ENVELOPE)
-        text = card["attachments"][0]["content"]["body"][0]["text"]
-        self.assertIn("succeeded", text)
-        self.assertIn("demo", text)
-        actions = card["attachments"][0]["content"]["actions"]
-        self.assertEqual(actions[0]["url"], "http://demo.localhost")
-        self.assertIn("inst-001", actions[1]["url"])
+    def test_fallback_card_default_domain(self):
+        with patch.object(server, "SITE_DOMAIN", "localhost"), \
+             patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(SAMPLE_ENVELOPE)
+            site_action = card["attachments"][0]["content"]["actions"][0]
+            self.assertEqual(site_action["url"], "https://demo.localhost")
 
-    def test_render_custom_card_failure(self):
+
+class TestBuildTemplateVariables(unittest.TestCase):
+    def test_all_keys_present(self):
+        with patch.object(server, "SITE_DOMAIN", "klaravik.test"), \
+             patch.object(server, "STACK_MANAGER_URL", "https://sm.example"):
+            variables = server.build_template_variables(SAMPLE_ENVELOPE)
+        expected_keys = {
+            "name", "namespace", "branch", "cluster_id", "status",
+            "instance_id", "emoji", "outcome", "color",
+            "instance_url", "site_url", "site_domain", "stack_manager_url",
+        }
+        self.assertEqual(set(variables.keys()), expected_keys)
+
+    def test_success_variables(self):
+        with patch.object(server, "SITE_DOMAIN", "dev.local"), \
+             patch.object(server, "STACK_MANAGER_URL", "https://sm"):
+            v = server.build_template_variables(SAMPLE_ENVELOPE)
+        self.assertEqual(v["name"], "demo")
+        self.assertEqual(v["emoji"], "✅")
+        self.assertEqual(v["outcome"], "succeeded")
+        self.assertEqual(v["color"], "good")
+        self.assertEqual(v["site_url"], "https://demo.dev.local")
+        self.assertEqual(v["site_domain"], "dev.local")
+        self.assertEqual(v["instance_url"], "https://sm/stack-instances/inst-001")
+
+    def test_failure_variables(self):
         env = {**SAMPLE_ENVELOPE, "instance": {**SAMPLE_ENVELOPE["instance"], "status": "error"}}
-        card = server.render_custom_card(self.TEMPLATE, env)
-        text = card["attachments"][0]["content"]["body"][0]["text"]
-        self.assertIn("failed", text)
+        with patch.object(server, "SITE_DOMAIN", "x"), \
+             patch.object(server, "STACK_MANAGER_URL", "https://sm"):
+            v = server.build_template_variables(env)
+        self.assertEqual(v["emoji"], "❌")
+        self.assertEqual(v["outcome"], "failed")
+        self.assertEqual(v["color"], "attention")
 
-    def test_build_uses_custom_template_when_set(self):
-        with patch.object(server, "_card_template", self.TEMPLATE):
+
+class TestRenderTemplate(unittest.TestCase):
+    def test_simple_substitution(self):
+        template = '{"title": "{{name}} on {{site_domain}}"}'
+        result = server.render_template(template, {"name": "demo", "site_domain": "klaravik.test"})
+        self.assertEqual(result["title"], "demo on klaravik.test")
+
+    def test_unknown_placeholder_kept(self):
+        template = '{"title": "{{unknown}}"}'
+        result = server.render_template(template, {"name": "demo"})
+        self.assertEqual(result["title"], "{{unknown}}")
+
+    def test_full_card_template(self):
+        template = json.dumps({
+            "type": "message",
+            "attachments": [{
+                "content": {
+                    "body": [{"text": "{{emoji}} Deploy {{outcome}} — {{name}}"}],
+                    "actions": [
+                        {"type": "Action.OpenUrl", "url": "https://{{name}}.{{site_domain}}"},
+                        {"type": "Action.OpenUrl", "url": "{{instance_url}}"},
+                    ],
+                },
+            }],
+        })
+        variables = {
+            "name": "olofm",
+            "site_domain": "klaravik.test",
+            "emoji": "✅",
+            "outcome": "succeeded",
+            "instance_url": "https://sm/stack-instances/abc",
+        }
+        result = server.render_template(template, variables)
+        self.assertEqual(result["attachments"][0]["content"]["actions"][0]["url"], "https://olofm.klaravik.test")
+        self.assertIn("succeeded", result["attachments"][0]["content"]["body"][0]["text"])
+
+
+class TestCardTemplateIntegration(unittest.TestCase):
+    def test_template_path_used_when_set(self):
+        template = json.dumps({
+            "type": "message",
+            "text": "{{name}} deployed to {{site_domain}}",
+        })
+        with patch.object(server, "_card_template", template), \
+             patch.object(server, "SITE_DOMAIN", "klaravik.test"), \
+             patch.object(server, "STACK_MANAGER_URL", "https://sm"):
             card = server.build_adaptive_card(SAMPLE_ENVELOPE)
-            actions = card["attachments"][0]["content"]["actions"]
-            self.assertEqual(len(actions), 2)
-            self.assertEqual(actions[0]["title"], "Site")
+        self.assertEqual(card["text"], "demo deployed to klaravik.test")
 
-    def test_build_uses_default_when_no_template(self):
-        with patch.object(server, "_card_template", None):
+    def test_fallback_when_no_template(self):
+        with patch.object(server, "_card_template", None), \
+             patch.object(server, "SITE_DOMAIN", "localhost"):
             card = server.build_adaptive_card(SAMPLE_ENVELOPE)
-            actions = card["attachments"][0]["content"]["actions"]
-            self.assertEqual(actions[0]["title"], "View instance")
+        self.assertEqual(card["type"], "message")
+        self.assertIn("attachments", card)
 
-    def test_load_card_template_returns_none_when_not_set(self):
+
+class TestLoadCardTemplate(unittest.TestCase):
+    def test_empty_path_returns_none(self):
         with patch.object(server, "CARD_TEMPLATE_FILE", ""):
             self.assertIsNone(server.load_card_template())
 
-    def test_load_card_template_returns_none_on_missing_file(self):
+    def test_missing_file_returns_none(self):
         with patch.object(server, "CARD_TEMPLATE_FILE", "/nonexistent/card.json"):
             self.assertIsNone(server.load_card_template())
+
+    def test_existing_file_returns_content(self):
+        import tempfile, os
+        content = '{"type": "message", "text": "{{name}}"}'
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(content)
+            f.flush()
+            path = f.name
+        try:
+            with patch.object(server, "CARD_TEMPLATE_FILE", path):
+                result = server.load_card_template()
+            self.assertEqual(result, content)
+        finally:
+            os.unlink(path)
 
 
 class TestEnqueueCard(unittest.TestCase):
