@@ -174,6 +174,119 @@ def build_adaptive_card(envelope: dict) -> dict:
     return card
 
 
+# --- Notification channel payload support ---
+# Generic payloads from k8s-stack-manager notification channels have "event_type"
+# instead of "event". The extension formats these into Adaptive Cards.
+
+NOTIFICATION_COLORS: dict[str, str] = {
+    "deployment.success": "good",
+    "deployment.error": "attention",
+    "deployment.partial": "warning",
+    "deploy.timeout": "attention",
+    "clean.error": "attention",
+    "rollback.error": "attention",
+    "stop.error": "attention",
+    "stack.expiring": "warning",
+    "stack.expired": "warning",
+    "quota.warning": "warning",
+    "secret.expiring": "warning",
+}
+
+NOTIFICATION_EMOJIS: dict[str, str] = {
+    "good": "✅",
+    "attention": "❌",
+    "warning": "⚠️",
+}
+
+
+def build_notification_card(payload: dict) -> dict:
+    """Build an Adaptive Card from a generic notification channel payload."""
+    global _card_template
+
+    event_type = payload.get("event_type", "unknown")
+    title = payload.get("title", "Notification")
+    message = payload.get("message", "")
+    user = payload.get("user_display_name", "")
+    entity_type = payload.get("entity_type", "")
+    entity_id = payload.get("entity_id", "")
+
+    if _card_template is not None:
+        variables = {
+            "event_type": json.dumps(str(event_type))[1:-1],
+            "title": json.dumps(str(title))[1:-1],
+            "message": json.dumps(str(message))[1:-1],
+            "user_display_name": json.dumps(str(user or ""))[1:-1],
+            "entity_type": json.dumps(str(entity_type or ""))[1:-1],
+            "entity_id": json.dumps(str(entity_id or ""))[1:-1],
+            "stack_manager_url": json.dumps(str(STACK_MANAGER_URL or ""))[1:-1],
+            "site_domain": json.dumps(str(SITE_DOMAIN or ""))[1:-1],
+        }
+        try:
+            return render_template(_card_template, variables)
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"WARN template render failed, using fallback card: {exc}", file=sys.stderr, flush=True)
+
+    color = NOTIFICATION_COLORS.get(event_type, "default")
+    emoji = NOTIFICATION_EMOJIS.get(color, "ℹ️")
+
+    heading = f"{emoji} {title}"
+    if user and user != "System":
+        heading += f" — {user}"
+
+    body: list[dict] = [
+        {
+            "type": "TextBlock",
+            "size": "medium",
+            "weight": "bolder",
+            "text": heading,
+            "style": "heading",
+            "color": color,
+            "wrap": True,
+        },
+    ]
+
+    if message:
+        body.append({
+            "type": "TextBlock",
+            "text": message,
+            "wrap": True,
+        })
+
+    facts = [{"title": "Event", "value": event_type}]
+    if user:
+        facts.append({"title": "User", "value": user})
+    if entity_type and entity_id:
+        facts.append({"title": "Entity", "value": f"{entity_type}/{entity_id}"})
+
+    body.append({"type": "FactSet", "facts": facts})
+
+    actions: list[dict] = []
+    if entity_type and entity_id:
+        entity_url = f"{STACK_MANAGER_URL}/{entity_type.replace('_', '-')}s/{entity_id}"
+        actions.append({
+            "type": "Action.OpenUrl",
+            "title": "View in Dashboard",
+            "url": entity_url,
+        })
+
+    return {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "body": body,
+                    "actions": actions,
+                },
+            }
+        ],
+    }
+
+
 def post_to_teams(payload: dict) -> None:
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
@@ -277,17 +390,29 @@ class HookHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":"invalid json"}')
             return
 
-        event = envelope.get("event", "")
-        instance = envelope.get("instance", {})
-        request_id = envelope.get("request_id", "")
-        print(
-            f"INFO event={event} instance={instance.get('name', '?')} request_id={request_id}",
-            flush=True,
-        )
-
-        if event == "deploy-finalized" and TEAMS_WEBHOOK_URL:
-            card = build_adaptive_card(envelope)
-            enqueue_card(card)
+        # Detect payload format: notification channels use "event_type",
+        # hooks use "event".
+        if "event_type" in envelope:
+            event_type = envelope.get("event_type", "")
+            user = envelope.get("user_display_name", "")
+            print(
+                f"INFO notification event_type={event_type} user={user}",
+                flush=True,
+            )
+            if TEAMS_WEBHOOK_URL:
+                card = build_notification_card(envelope)
+                enqueue_card(card)
+        else:
+            event = envelope.get("event", "")
+            instance = envelope.get("instance", {})
+            request_id = envelope.get("request_id", "")
+            print(
+                f"INFO hook event={event} instance={instance.get('name', '?')} request_id={request_id}",
+                flush=True,
+            )
+            if event == "deploy-finalized" and TEAMS_WEBHOOK_URL:
+                card = build_adaptive_card(envelope)
+                enqueue_card(card)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
