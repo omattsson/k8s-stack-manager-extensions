@@ -212,16 +212,19 @@ def build_notification_card(payload: dict) -> dict:
 
     if _card_template is not None:
         variables = {
-            "event_type": str(event_type),
-            "title": str(title),
-            "message": str(message),
-            "user_display_name": str(user or ""),
-            "entity_type": str(entity_type or ""),
-            "entity_id": str(entity_id or ""),
+            "event_type": json.dumps(str(event_type))[1:-1],
+            "title": json.dumps(str(title))[1:-1],
+            "message": json.dumps(str(message))[1:-1],
+            "user_display_name": json.dumps(str(user or ""))[1:-1],
+            "entity_type": json.dumps(str(entity_type or ""))[1:-1],
+            "entity_id": json.dumps(str(entity_id or ""))[1:-1],
             "stack_manager_url": STACK_MANAGER_URL,
             "site_domain": SITE_DOMAIN,
         }
-        return render_template(_card_template, variables)
+        try:
+            return render_template(_card_template, variables)
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"WARN template render failed, using fallback card: {exc}", file=sys.stderr, flush=True)
 
     color = NOTIFICATION_COLORS.get(event_type, "default")
     emoji = NOTIFICATION_EMOJIS.get(color, "ℹ️")

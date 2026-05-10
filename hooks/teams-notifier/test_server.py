@@ -537,6 +537,8 @@ class TestNotificationCardTemplate(unittest.TestCase):
 class TestHTTPHandlerNotificationPayload(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls._old_webhook = server.TEAMS_WEBHOOK_URL
+        cls._old_secret = server.SECRET
         server.TEAMS_WEBHOOK_URL = "http://localhost:1/fake"
         server.SECRET = ""
         cls.httpd = HTTPServer(("127.0.0.1", 0), server.HookHandler)
@@ -548,6 +550,10 @@ class TestHTTPHandlerNotificationPayload(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+        cls.httpd.server_close()
+        server.TEAMS_WEBHOOK_URL = cls._old_webhook
+        server.SECRET = cls._old_secret
 
     def test_notification_payload_enqueues_card(self):
         body = json.dumps(SAMPLE_NOTIFICATION).encode()
