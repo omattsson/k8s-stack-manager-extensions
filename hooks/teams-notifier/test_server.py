@@ -431,5 +431,85 @@ class TestHTTPHandler(unittest.TestCase):
             conn.close()
 
 
+SAMPLE_NOTIFICATION = {
+    "event_type": "deployment.success",
+    "timestamp": "2026-05-10T12:00:00Z",
+    "title": "Deployment succeeded",
+    "message": "my-stack deployed to production cluster",
+    "user_display_name": "Olof Mattsson",
+    "entity_type": "stack_instance",
+    "entity_id": "inst-001",
+}
+
+
+class TestBuildNotificationCard(unittest.TestCase):
+    def test_basic_card_structure(self):
+        card = server.build_notification_card(SAMPLE_NOTIFICATION)
+        self.assertEqual(card["type"], "message")
+        attachments = card["attachments"]
+        self.assertEqual(len(attachments), 1)
+        content = attachments[0]["content"]
+        self.assertEqual(content["type"], "AdaptiveCard")
+        self.assertEqual(content["version"], "1.4")
+
+    def test_heading_includes_user(self):
+        card = server.build_notification_card(SAMPLE_NOTIFICATION)
+        body = card["attachments"][0]["content"]["body"]
+        heading = body[0]["text"]
+        self.assertIn("Deployment succeeded", heading)
+        self.assertIn("Olof Mattsson", heading)
+
+    def test_heading_omits_system_user(self):
+        payload = {**SAMPLE_NOTIFICATION, "user_display_name": "System"}
+        card = server.build_notification_card(payload)
+        heading = card["attachments"][0]["content"]["body"][0]["text"]
+        self.assertNotIn("System", heading)
+
+    def test_success_color(self):
+        card = server.build_notification_card(SAMPLE_NOTIFICATION)
+        color = card["attachments"][0]["content"]["body"][0]["color"]
+        self.assertEqual(color, "good")
+
+    def test_error_color(self):
+        payload = {**SAMPLE_NOTIFICATION, "event_type": "deployment.error", "title": "Deploy failed"}
+        card = server.build_notification_card(payload)
+        color = card["attachments"][0]["content"]["body"][0]["color"]
+        self.assertEqual(color, "attention")
+
+    def test_warning_color(self):
+        payload = {**SAMPLE_NOTIFICATION, "event_type": "stack.expiring", "title": "Stack expiring"}
+        card = server.build_notification_card(payload)
+        color = card["attachments"][0]["content"]["body"][0]["color"]
+        self.assertEqual(color, "warning")
+
+    def test_entity_link_action(self):
+        card = server.build_notification_card(SAMPLE_NOTIFICATION)
+        actions = card["attachments"][0]["content"]["actions"]
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["type"], "Action.OpenUrl")
+        self.assertIn("stack-instances/inst-001", actions[0]["url"])
+
+    def test_no_actions_without_entity(self):
+        payload = {**SAMPLE_NOTIFICATION, "entity_type": "", "entity_id": ""}
+        card = server.build_notification_card(payload)
+        actions = card["attachments"][0]["content"]["actions"]
+        self.assertEqual(len(actions), 0)
+
+    def test_message_in_body(self):
+        card = server.build_notification_card(SAMPLE_NOTIFICATION)
+        body = card["attachments"][0]["content"]["body"]
+        texts = [b["text"] for b in body if b["type"] == "TextBlock"]
+        self.assertTrue(any("my-stack deployed" in t for t in texts))
+
+    def test_facts_include_event_and_user(self):
+        card = server.build_notification_card(SAMPLE_NOTIFICATION)
+        body = card["attachments"][0]["content"]["body"]
+        factsets = [b for b in body if b["type"] == "FactSet"]
+        self.assertEqual(len(factsets), 1)
+        fact_titles = [f["title"] for f in factsets[0]["facts"]]
+        self.assertIn("Event", fact_titles)
+        self.assertIn("User", fact_titles)
+
+
 if __name__ == "__main__":
     unittest.main()
