@@ -218,8 +218,8 @@ def build_notification_card(payload: dict) -> dict:
             "user_display_name": json.dumps(str(user or ""))[1:-1],
             "entity_type": json.dumps(str(entity_type or ""))[1:-1],
             "entity_id": json.dumps(str(entity_id or ""))[1:-1],
-            "stack_manager_url": STACK_MANAGER_URL,
-            "site_domain": SITE_DOMAIN,
+            "stack_manager_url": json.dumps(str(STACK_MANAGER_URL or ""))[1:-1],
+            "site_domain": json.dumps(str(SITE_DOMAIN or ""))[1:-1],
         }
         try:
             return render_template(_card_template, variables)
