@@ -511,5 +511,62 @@ class TestBuildNotificationCard(unittest.TestCase):
         self.assertIn("User", fact_titles)
 
 
+class TestNotificationCardTemplate(unittest.TestCase):
+    def test_template_rendering_with_notification_payload(self):
+        template = '{"text": "{{event_type}}: {{title}} by {{user_display_name}}"}'
+        old = server._card_template
+        try:
+            server._card_template = template
+            card = server.build_notification_card(SAMPLE_NOTIFICATION)
+            self.assertEqual(card["text"], "deployment.success: Deployment succeeded by Olof Mattsson")
+        finally:
+            server._card_template = old
+
+    def test_template_casts_none_to_empty_string(self):
+        template = '{"text": "{{entity_type}}/{{entity_id}}"}'
+        payload = {**SAMPLE_NOTIFICATION, "entity_type": None, "entity_id": None}
+        old = server._card_template
+        try:
+            server._card_template = template
+            card = server.build_notification_card(payload)
+            self.assertEqual(card["text"], "/")
+        finally:
+            server._card_template = old
+
+
+class TestHTTPHandlerNotificationPayload(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        server.TEAMS_WEBHOOK_URL = "http://localhost:1/fake"
+        server.SECRET = ""
+        cls.httpd = HTTPServer(("127.0.0.1", 0), server.HookHandler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.thread.daemon = True
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def test_notification_payload_enqueues_card(self):
+        body = json.dumps(SAMPLE_NOTIFICATION).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/hook", body, {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read())
+        self.assertTrue(data.get("allowed", False))
+        conn.close()
+
+    def test_hook_payload_still_works(self):
+        body = json.dumps(SAMPLE_ENVELOPE).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/hook", body, {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

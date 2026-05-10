@@ -212,12 +212,12 @@ def build_notification_card(payload: dict) -> dict:
 
     if _card_template is not None:
         variables = {
-            "event_type": event_type,
-            "title": title,
-            "message": message,
-            "user_display_name": user,
-            "entity_type": entity_type,
-            "entity_id": entity_id,
+            "event_type": str(event_type),
+            "title": str(title),
+            "message": str(message),
+            "user_display_name": str(user or ""),
+            "entity_type": str(entity_type or ""),
+            "entity_id": str(entity_id or ""),
             "stack_manager_url": STACK_MANAGER_URL,
             "site_domain": SITE_DOMAIN,
         }
@@ -252,7 +252,7 @@ def build_notification_card(payload: dict) -> dict:
     facts = [{"title": "Event", "value": event_type}]
     if user:
         facts.append({"title": "User", "value": user})
-    if entity_type:
+    if entity_type and entity_id:
         facts.append({"title": "Entity", "value": f"{entity_type}/{entity_id}"})
 
     body.append({"type": "FactSet", "facts": facts})
