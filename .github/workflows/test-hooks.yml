@@ -26,6 +26,23 @@ jobs:
           cd ../security-scan-gate
           go test ./...
 
+  test-ci-trigger-gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./hooks/ci-trigger-gate
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: hooks/ci-trigger-gate/go.mod
+          cache-dependency-path: hooks/ci-trigger-gate/go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+
   test-python-hooks:
     runs-on: ubuntu-latest
     strategy:
