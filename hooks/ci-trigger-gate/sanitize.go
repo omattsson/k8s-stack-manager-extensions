@@ -45,21 +45,48 @@ func sanitizeImageTag(branch string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Skip logic
+// Skip logic and input checks
 // ---------------------------------------------------------------------------
 
-var semverRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+`)
+// semverTagRe matches release version tags such as v1.2.3, 1.2.3-rc.1 or V1.2.3.
+var semverTagRe = regexp.MustCompile(`(?i)^v?\d+\.\d+\.\d+([.-].*)?$`)
+
+// defaultProtectedTags is the default of PROTECTED_TAGS.
+const defaultProtectedTags = `^(latest|v?\d+\.\d+\.\d+([.-].*)?)$`
 
 // skipReason returns a reason when the gate must not touch the chart.
-// It returns "" when the gate must process the chart.
-func skipReason(chart ChartRef, branch string) string {
+// It returns "" when the gate must process the chart. The check uses the
+// image tag, because the tag is what the registry sees.
+func skipReason(chart ChartRef, tag string) string {
 	if chart.BuildPipelineID == "" {
 		return "no build_pipeline_id"
 	}
-	if semverRe.MatchString(branch) {
+	if semverTagRe.MatchString(tag) {
 		// Release images are built by the release flow. Never replace them
-		// with an alias.
-		return "release version " + branch
+		// with an alias and never build them here.
+		return "release version " + tag
 	}
 	return ""
+}
+
+var (
+	repoNameRe = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
+	tagNameRe  = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$`)
+	branchRe   = regexp.MustCompile(`^[A-Za-z0-9_./-]{1,250}$`)
+)
+
+// validRepo reports whether s is a valid image repository name.
+func validRepo(s string) bool { return repoNameRe.MatchString(s) }
+
+// validTag reports whether s is a valid image tag.
+func validTag(s string) bool { return tagNameRe.MatchString(s) }
+
+// validBranch reports whether a branch name is safe to send to the pipeline.
+// The pipeline gets the branch as a template parameter, so the gate accepts
+// only a small set of characters.
+func validBranch(s string) bool {
+	return branchRe.MatchString(s) &&
+		!strings.Contains(s, "..") &&
+		!strings.HasPrefix(s, "-") &&
+		!strings.HasPrefix(s, "/")
 }

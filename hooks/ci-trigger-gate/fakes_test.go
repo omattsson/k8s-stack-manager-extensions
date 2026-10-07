@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -233,6 +234,11 @@ type fakeADO struct {
 	queued         []queuedBuild
 	// omitListTP removes template parameters from the build list response.
 	omitListTP bool
+	// failBuildGets makes every read of one build fail with status 500.
+	failBuildGets bool
+	// queuePolls is the number of status reads before a queued build ends.
+	queuePolls int
+	buildGets  int
 	nextID     int
 	mu         sync.Mutex
 }
@@ -243,6 +249,7 @@ func newFakeADO(t *testing.T) *fakeADO {
 		builds:     map[int]*fakeBuild{},
 		nextID:     100,
 		nextResult: "succeeded",
+		queuePolls: 2,
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
@@ -253,6 +260,18 @@ func (f *fakeADO) queuedCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.queued)
+}
+
+func (f *fakeADO) getCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buildGets
+}
+
+func (f *fakeADO) set(fn func(*fakeADO)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn(f)
 }
 
 func (f *fakeADO) firstQueued() queuedBuild {
@@ -321,7 +340,7 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 			definition:  q.Definition.ID,
 			status:      "notStarted",
 			tp:          q.TemplateParameters,
-			pollsLeft:   2,
+			pollsLeft:   f.queuePolls,
 			finalResult: f.nextResult,
 		}
 		if f.onQueueSuccess != nil {
@@ -332,6 +351,11 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(f.buildJSON(b, true))
 
 	case strings.Contains(path, "/_apis/build/builds/") && r.Method == http.MethodGet:
+		f.buildGets++
+		if f.failBuildGets {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
 		id, _ := strconv.Atoi(path[strings.LastIndex(path, "/")+1:])
 		b, ok := f.builds[id]
 		if !ok {
@@ -388,6 +412,8 @@ func testConfig() config {
 		RegistryAuth:         authWorkloadIdentity,
 		ADOAuth:              authWorkloadIdentity,
 		PipelineSourceBranch: "refs/heads/main",
+		ProtectedTags:        regexp.MustCompile(defaultProtectedTags),
+		AllowUnsigned:        true,
 		PollInterval:         5 * time.Millisecond,
 		BuildTimeout:         5 * time.Second,
 		CacheTTL:             time.Minute,

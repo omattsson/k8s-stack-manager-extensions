@@ -45,7 +45,15 @@ func parseADORepoURL(raw string) (adoRepo, bool) {
 		if len(parts) != 3 {
 			return adoRepo{}, false
 		}
-		return cleanADORepo(parts[0], parts[1], parts[2])
+		var segs [3]string
+		for i, p := range parts {
+			v, err := url.PathUnescape(p)
+			if err != nil {
+				return adoRepo{}, false
+			}
+			segs[i] = v
+		}
+		return cleanADORepo(segs[0], segs[1], segs[2])
 	}
 
 	u, err := url.Parse(raw)

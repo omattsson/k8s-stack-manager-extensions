@@ -82,7 +82,7 @@ func newACRClient(host, mode, username, password, tenantID string, entra *entraT
 }
 
 func (r *acrClient) headDigest(ctx context.Context, repo, ref string) (string, error) {
-	resp, err := r.do(ctx, repo, http.MethodHead, "/v2/"+repo+"/manifests/"+ref, nil, "")
+	resp, err := r.do(ctx, repo, http.MethodHead, manifestPath(repo, ref), nil, "")
 	if err != nil {
 		return "", err
 	}
@@ -106,7 +106,7 @@ func (r *acrClient) headDigest(ctx context.Context, repo, ref string) (string, e
 }
 
 func (r *acrClient) getManifest(ctx context.Context, repo, ref string) (*manifest, error) {
-	resp, err := r.do(ctx, repo, http.MethodGet, "/v2/"+repo+"/manifests/"+ref, nil, "")
+	resp, err := r.do(ctx, repo, http.MethodGet, manifestPath(repo, ref), nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +131,7 @@ func (r *acrClient) getManifest(ctx context.Context, repo, ref string) (*manifes
 }
 
 func (r *acrClient) putManifest(ctx context.Context, repo, tag string, m *manifest) error {
-	resp, err := r.do(ctx, repo, http.MethodPut, "/v2/"+repo+"/manifests/"+tag, m.body, m.contentType)
+	resp, err := r.do(ctx, repo, http.MethodPut, manifestPath(repo, tag), m.body, m.contentType)
 	if err != nil {
 		return err
 	}
@@ -314,6 +314,15 @@ func (r *acrClient) postToken(req *http.Request, out any) error {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+// manifestPath returns the /v2 manifest path. It escapes each path segment.
+func manifestPath(repo, ref string) string {
+	segs := strings.Split(repo, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	return "/v2/" + strings.Join(segs, "/") + "/manifests/" + url.PathEscape(ref)
 }
 
 // shortDigest returns the first 12 hex characters of a digest, for logs.

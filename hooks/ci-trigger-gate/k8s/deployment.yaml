@@ -35,11 +35,13 @@ data:
   IMAGE_REPO_PREFIX: "dev/"
   CHART_EXTRA_IMAGES: ""
   FALLBACK_TAG: "latest-dev"
+  PROTECTED_TAGS: "^(latest|v?\\d+\\.\\d+\\.\\d+([.-].*)?)$"
   DEFAULT_BRANCHES: "main,master"
   PIPELINE_SOURCE_BRANCH: "refs/heads/main"
   POLL_INTERVAL_SECONDS: "15"
   BUILD_TIMEOUT_MINUTES: "25"
   CACHE_TTL_MINUTES: "5"
+  SHUTDOWN_TIMEOUT_SECONDS: "30"
   # Client ID of the managed identity or app registration with the
   # federated credential for system:serviceaccount:extensions:ci-trigger-gate.
   AZURE_CLIENT_ID: "REPLACE_ME"
@@ -65,6 +67,9 @@ spec:
     spec:
       serviceAccountName: ci-trigger-gate
       automountServiceAccountToken: false
+      # Longer than SHUTDOWN_TIMEOUT_SECONDS, so in-flight hooks can finish.
+      # A rollout during a long build wait still denies that deploy.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: ci-trigger-gate
           image: ghcr.io/omattsson/k8s-stack-manager-extensions/ci-trigger-gate:latest
@@ -85,13 +90,16 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Readiness uses /healthz on purpose. /readyz depends on Entra ID,
+          # the registry and Azure DevOps. A short outage there would remove
+          # the pod from the Service and block all deploys. Check /readyz by
+          # hand after a deploy or a credential change.
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /healthz
               port: 8080
             initialDelaySeconds: 5
-            periodSeconds: 30
-            timeoutSeconds: 20
+            periodSeconds: 10
           resources:
             requests:
               cpu: 10m

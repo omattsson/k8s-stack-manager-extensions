@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -66,7 +69,7 @@ func TestParseADORepoURL(t *testing.T) {
 		{"query and extra path", "https://dev.azure.com/myorg/My%20Project/_git/my-repo/branches?x=1", want, true},
 		{"visualstudio.com", "https://myorg.visualstudio.com/My%20Project/_git/my-repo", want, true},
 		{"visualstudio.com DefaultCollection", "https://myorg.visualstudio.com/DefaultCollection/My%20Project/_git/my-repo", want, true},
-		{"ssh", "git@ssh.dev.azure.com:v3/myorg/My%20Project/my-repo", adoRepo{Org: "myorg", Project: "My%20Project", Repo: "my-repo"}, true},
+		{"ssh", "git@ssh.dev.azure.com:v3/myorg/My%20Project/my-repo", want, true},
 		{"gitlab", "https://gitlab.com/group/repo.git", adoRepo{}, false},
 		{"github", "https://github.com/org/repo", adoRepo{}, false},
 		{"no _git", "https://dev.azure.com/myorg/proj/repo", adoRepo{}, false},
@@ -93,22 +96,25 @@ func TestVerifySignature(t *testing.T) {
 	good := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 
 	tests := []struct {
-		name   string
-		secret string
-		sig    string
-		want   bool
+		name          string
+		secret        string
+		sig           string
+		allowUnsigned bool
+		want          bool
 	}{
-		{"valid", "s3cret", good, true},
-		{"wrong secret", "other", good, false},
-		{"missing", "s3cret", "", false},
-		{"no prefix", "s3cret", strings.TrimPrefix(good, "sha256="), false},
-		{"no secret configured", "", "", true},
+		{"valid", "s3cret", good, false, true},
+		{"wrong secret", "other", good, false, false},
+		{"missing", "s3cret", "", false, false},
+		{"missing with allow unsigned", "s3cret", "", true, false},
+		{"no prefix", "s3cret", strings.TrimPrefix(good, "sha256="), false, false},
+		{"no secret fails closed", "", "", false, false},
+		{"no secret with allow unsigned", "", "", true, true},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := verifySignature(tt.secret, body, tt.sig); got != tt.want {
+			if got := verifySignature(tt.secret, tt.allowUnsigned, body, tt.sig); got != tt.want {
 				t.Errorf("verifySignature = %v, want %v", got, tt.want)
 			}
 		})
@@ -117,15 +123,61 @@ func TestVerifySignature(t *testing.T) {
 
 func TestLoadConfig(t *testing.T) {
 	t.Parallel()
+	// env adds a webhook secret unless the map sets one.
 	env := func(m map[string]string) func(string) string {
-		return func(k string) string { return m[k] }
+		return func(k string) string {
+			if v, ok := m[k]; ok {
+				return v
+			}
+			if k == "CI_TRIGGER_WEBHOOK_SECRET" {
+				return "s"
+			}
+			return ""
+		}
 	}
+
+	t.Run("empty secret fails closed", func(t *testing.T) {
+		t.Parallel()
+		if _, err := loadConfig(env(map[string]string{"CI_TRIGGER_WEBHOOK_SECRET": ""})); err == nil {
+			t.Error("loadConfig without secret succeeded")
+		}
+		cfg, err := loadConfig(env(map[string]string{"CI_TRIGGER_WEBHOOK_SECRET": "", "ALLOW_UNSIGNED": "true"}))
+		if err != nil || !cfg.AllowUnsigned {
+			t.Errorf("ALLOW_UNSIGNED=true: cfg.AllowUnsigned=%v err=%v", cfg.AllowUnsigned, err)
+		}
+	})
+
+	t.Run("protected tags", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := loadConfig(env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for tag, want := range map[string]bool{
+			"latest": true, "latest-dev": true, "v1.2.3": true, "1.2.3-rc1": true, "1.2.3.4": true,
+			"feature-x": false, "main": false, "latest-feature": false, "v1.2": false,
+		} {
+			if got := cfg.isProtected(tag); got != want {
+				t.Errorf("isProtected(%q) = %v, want %v", tag, got, want)
+			}
+		}
+		cfg, err = loadConfig(env(map[string]string{"PROTECTED_TAGS": "^stable$", "FALLBACK_TAG": "dev-base"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.isProtected("stable") || !cfg.isProtected("dev-base") || cfg.isProtected("latest") {
+			t.Error("custom PROTECTED_TAGS not used")
+		}
+	})
 
 	t.Run("defaults", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := loadConfig(env(nil))
 		if err != nil {
 			t.Fatal(err)
+		}
+		if cfg.ShutdownTimeout != 30*time.Second || cfg.AllowUnsigned {
+			t.Errorf("ShutdownTimeout = %s, AllowUnsigned = %v", cfg.ShutdownTimeout, cfg.AllowUnsigned)
 		}
 		if cfg.ListenAddr != ":8080" || cfg.FallbackTag != "latest-dev" || cfg.PipelineSourceBranch != "refs/heads/main" ||
 			cfg.PollInterval != 15*time.Second || cfg.BuildTimeout != 25*time.Minute || cfg.CacheTTL != 5*time.Minute ||
@@ -201,6 +253,8 @@ func TestLoadConfig(t *testing.T) {
 		{"CHART_EXTRA_IMAGES": "=x"},
 		{"REGISTRY_AUTH": "token"},
 		{"ADO_AUTH": "basic"},
+		{"PROTECTED_TAGS": "("},
+		{"FALLBACK_TAG": "bad tag"},
 	} {
 		bad := bad
 		t.Run("invalid "+strings.Join(keys(bad), ","), func(t *testing.T) {
@@ -379,22 +433,252 @@ func TestHook_AliasSkippedWhenDigestEqual(t *testing.T) {
 	}
 }
 
-func TestHook_DefaultBranchFollowsFallback(t *testing.T) {
+func TestHook_DefaultBranchKeepsCIImage(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t, nil)
-	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"new-fallback"}`)
-	e.acr.push("dev/api", "main", dockerV2Type, `{"m":"old"}`)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "main", dockerV2Type, `{"m":"ci-main"}`)
 	e.ado.refs["org/proj/api"] = []string{"main"}
 
 	res := e.post(t, envelope("", appChart("api", "main")))
 	if !res.resp.Allowed {
 		t.Fatalf("resp = %+v", res.resp)
 	}
-	if e.acr.digest("dev/api", "main") != e.acr.digest("dev/api", "latest-dev") {
-		t.Error("main tag does not follow latest-dev")
+	if e.acr.digest("dev/api", "main") != digestOf([]byte(`{"m":"ci-main"}`)) || e.acr.putCount() != 0 {
+		t.Error("gate overwrote the CI image of the default branch")
 	}
-	if e.ado.queuedCount() != 0 {
-		t.Error("gate queued a build for a default branch")
+	if !strings.Contains(res.logText(), "keeping existing dev/api:main") || e.ado.queuedCount() != 0 {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_DefaultBranchAliasCreated(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+
+	res := e.post(t, envelope("", appChart("api", "master")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	if e.acr.digest("dev/api", "master") != e.acr.digest("dev/api", "latest-dev") {
+		t.Error("master is not an alias of latest-dev")
+	}
+}
+
+func TestHook_ExistingRealTagNotOverwritten(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"real"}`)
+	// The branch is gone from the repo, but its image stays.
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	if e.acr.putCount() != 0 || e.acr.digest("dev/api", "feature-x") != digestOf([]byte(`{"m":"real"}`)) {
+		t.Error("gate overwrote a real image")
+	}
+	if !strings.Contains(res.logText(), "keeping existing dev/api:feature-x") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_ProtectedTags(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		branch    string
+		push      bool
+		wantAllow bool
+		wantText  string
+	}{
+		{"latest exists", "latest", true, true, "protected tag"},
+		{"latest missing", "latest", false, false, "protected tag"},
+		{"fallback tag from branch", "Latest-Dev", true, true, "protected tag"},
+		{"fallback tag missing", "Latest-Dev", false, false, "protected tag"},
+		{"semver case-insensitive is skipped", "V1.2.3", false, true, "release version v1.2.3"},
+		{"semver pre-release is skipped", "1.4.0-RC.1", false, true, "release version 1.4.0-rc.1"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t, nil)
+			tag := sanitizeImageTag(tt.branch)
+			if tt.push {
+				e.acr.push("dev/api", tag, dockerV2Type, `{"m":"`+tag+`"}`)
+			}
+			e.ado.refs["org/proj/api"] = []string{tt.branch}
+			chart := appChart("api", tt.branch)
+			chart.ImageTag = ""
+
+			res := e.post(t, envelope("", chart))
+			if res.resp.Allowed != tt.wantAllow {
+				t.Fatalf("resp = %+v\n%s", res.resp, res.logText())
+			}
+			if text := res.resp.Message + res.logText(); !strings.Contains(text, tt.wantText) {
+				t.Errorf("output does not contain %q:\n%s", tt.wantText, text)
+			}
+			if e.acr.putCount() != 0 || e.ado.queuedCount() != 0 {
+				t.Errorf("puts = %d, queued = %d; want 0/0", e.acr.putCount(), e.ado.queuedCount())
+			}
+		})
+	}
+}
+
+func TestHook_InvalidInputDenied(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		chart    ChartRef
+		wantText string
+	}{
+		{"bad repo", func() ChartRef { c := appChart("Bad Name", "feature/x"); return c }(), "not a valid repository"},
+		{"bad tag", func() ChartRef { c := appChart("api", "feature/x"); c.ImageTag = "-bad"; return c }(), "not a valid tag"},
+		{"dotdot branch", appChart("api", "feature/../x"), "is not allowed"},
+		{"leading dash branch", appChart("api", "-x"), "is not allowed"},
+		{"leading slash branch", appChart("api", "/x"), "is not allowed"},
+		{"shell chars in branch", appChart("api", "a;rm -rf"), "is not allowed"},
+		{"bad branch with non-ADO source", func() ChartRef {
+			c := appChart("api", "$(id)")
+			c.SourceRepoURL = ""
+			return c
+		}(), "is not allowed"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t, nil)
+			e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+			res := e.post(t, envelope("", tt.chart))
+			if res.resp.Allowed || !strings.Contains(res.resp.Message, tt.wantText) {
+				t.Errorf("resp = %+v", res.resp)
+			}
+			if e.cred.count(acrScope)+e.cred.count(adoScope) != 0 {
+				t.Error("gate called the registry or ADO before the input check")
+			}
+		})
+	}
+}
+
+func TestHook_OrgMismatchDenied(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	chart := appChart("api", "feature/x")
+	chart.SourceRepoURL = "https://dev.azure.com/OtherOrg/proj/_git/api"
+	res := e.post(t, envelope("", chart))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, `"OtherOrg" is not ADO_ORG`) {
+		t.Errorf("resp = %+v", res.resp)
+	}
+	if e.cred.count(adoScope) != 0 {
+		t.Error("gate called ADO for another organization")
+	}
+
+	// The org check ignores case, and the project may differ.
+	e2 := newTestEnv(t, nil)
+	e2.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	chart.SourceRepoURL = "https://dev.azure.com/ORG/other-project/_git/api"
+	if res := e2.post(t, envelope("", chart)); !res.resp.Allowed {
+		t.Errorf("same org, other project: resp = %+v", res.resp)
+	}
+}
+
+func TestHook_TagEqualsFallbackNeverBuilds(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"latest-dev"}
+	res := e.post(t, envelope("", appChart("api", "latest-dev")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 0 || e.acr.putCount() != 0 {
+		t.Errorf("resp = %+v, queued = %d, puts = %d", res.resp, e.ado.queuedCount(), e.acr.putCount())
+	}
+}
+
+func TestHook_BuildDidNotPushDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback"}`) // alias
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	// The build succeeds but pushes nothing. The tag is still the alias.
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "did not push imageTag feature-x to dev/api") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+}
+
+func TestHook_PollErrorsDeny(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.failBuildGets = true
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "5 times in a row") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+	if n := e.ado.getCount(); n != maxPollErrors {
+		t.Errorf("build reads = %d, want %d", n, maxPollErrors)
+	}
+}
+
+func TestHook_FirstFailureStopsOtherCharts(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// "web" needs a build that never ends. "api" fails at once (no fallback).
+	e.acr.push("dev/web", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/web"] = []string{"feature/x"}
+	e.ado.queuePolls = 1 << 30
+
+	start := time.Now()
+	res := e.post(t, envelope("", appChart("web", "feature/x"), appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "api:") || strings.Contains(res.resp.Message, "web:") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("response took %s; the other chart did not stop", d)
+	}
+	n := e.ado.getCount()
+	time.Sleep(50 * time.Millisecond)
+	if e.ado.getCount() != n {
+		t.Error("gate still polls after the response")
+	}
+}
+
+func TestHook_ClientDisconnectStopsPolling(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.queuePolls = 1 << 30
+
+	body, _ := json.Marshal(envelope("", appChart("api", "feature/x")))
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader(string(body))).WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		e.h.hookHandler(httptest.NewRecorder(), req)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for e.ado.getCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the client went away")
+	}
+	n := e.ado.getCount()
+	time.Sleep(50 * time.Millisecond)
+	if e.ado.getCount() != n {
+		t.Error("gate still polls after the client went away")
 	}
 }
 
@@ -559,7 +843,7 @@ func TestHook_BuildSucceedsButImageMissingDenies(t *testing.T) {
 	e.ado.onQueueSuccess = func(tag string) { e.acr.push("dev/api", tag, dockerV2Type, `{"m":"built"}`) }
 
 	res := e.post(t, envelope("", appChart("api", "feature/x")))
-	if res.resp.Allowed || !strings.Contains(res.resp.Message, "dev/api-worker:feature-x does not exist") {
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "did not push imageTag feature-x to dev/api-worker") {
 		t.Errorf("resp = %+v", res.resp)
 	}
 }
@@ -612,6 +896,66 @@ func TestACR_WorkloadIdentityTokensCached(t *testing.T) {
 	}
 	if e.acr.exchangeCount() != 1 || e.cred.count(acrScope) != 1 {
 		t.Errorf("exchanges = %d, entra calls = %d; want 1/1", e.acr.exchangeCount(), e.cred.count(acrScope))
+	}
+}
+
+func TestACR_StaleTokenRetried(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "t", dockerV2Type, `{}`)
+	reg := e.h.registry.(*acrClient)
+	reg.tokens.put("repo:dev/api", "stale", time.Now().Add(time.Hour))
+	if d, err := reg.headDigest(t.Context(), "dev/api", "t"); err != nil || d == "" {
+		t.Fatalf("headDigest = %q, %v", d, err)
+	}
+	if v, _ := reg.tokens.get("repo:dev/api"); v != "acc|repository:dev/api:pull,push" {
+		t.Errorf("cached token = %q, want the new token", v)
+	}
+}
+
+func TestManifestPathEscapes(t *testing.T) {
+	t.Parallel()
+	if got := manifestPath("dev/a b", "x?y"); got != "/v2/dev/a%20b/manifests/x%3Fy" {
+		t.Errorf("manifestPath = %q", got)
+	}
+}
+
+func TestServeGracefulShutdown(t *testing.T) {
+	t.Parallel()
+	stopped := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // a hook that waits for a build
+		close(stopped)
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, srv, ln, 50*time.Millisecond) }()
+
+	resp, err := http.Get("http://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	cancel() // SIGTERM
+
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request was not stopped after the shutdown timeout")
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serve = %v", err)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("serve did not return")
 	}
 }
 

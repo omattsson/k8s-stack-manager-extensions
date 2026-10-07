@@ -17,11 +17,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -80,6 +84,7 @@ const maxRequestBodySize int64 = 1 << 20 // 1 MiB
 type config struct {
 	ExtraImages          map[string][]string
 	DefaultBranches      map[string]bool
+	ProtectedTags        *regexp.Regexp
 	ListenAddr           string
 	Secret               string
 	RegistryURL          string
@@ -98,6 +103,8 @@ type config struct {
 	PollInterval         time.Duration
 	BuildTimeout         time.Duration
 	CacheTTL             time.Duration
+	ShutdownTimeout      time.Duration
+	AllowUnsigned        bool
 }
 
 // loadConfig reads the configuration from getenv.
@@ -126,8 +133,23 @@ func loadConfig(getenv func(string) string) (config, error) {
 		PollInterval:         time.Duration(envInt(get, "POLL_INTERVAL_SECONDS", 15, 1)) * time.Second,
 		BuildTimeout:         time.Duration(envInt(get, "BUILD_TIMEOUT_MINUTES", 25, 1)) * time.Minute,
 		CacheTTL:             time.Duration(envInt(get, "CACHE_TTL_MINUTES", 5, 0)) * time.Minute,
+		ShutdownTimeout:      time.Duration(envInt(get, "SHUTDOWN_TIMEOUT_SECONDS", 30, 0)) * time.Second,
+		AllowUnsigned:        strings.EqualFold(get("ALLOW_UNSIGNED", ""), "true"),
 		DefaultBranches:      map[string]bool{},
 	}
+
+	if cfg.Secret == "" && !cfg.AllowUnsigned {
+		return config{}, errors.New("CI_TRIGGER_WEBHOOK_SECRET is not set; set ALLOW_UNSIGNED=true to accept unsigned requests")
+	}
+	if !validTag(cfg.FallbackTag) {
+		return config{}, fmt.Errorf("FALLBACK_TAG %q is not a valid image tag", cfg.FallbackTag)
+	}
+
+	protected, err := regexp.Compile(get("PROTECTED_TAGS", defaultProtectedTags))
+	if err != nil {
+		return config{}, fmt.Errorf("PROTECTED_TAGS: %w", err)
+	}
+	cfg.ProtectedTags = protected
 
 	for _, b := range strings.Split(get("DEFAULT_BRANCHES", "main,master"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
@@ -183,6 +205,15 @@ func parseExtraImages(s string) (map[string][]string, error) {
 	return out, nil
 }
 
+// isProtected reports whether the gate must never alias or build tag.
+// FALLBACK_TAG is always protected.
+func (c config) isProtected(tag string) bool {
+	if tag == c.FallbackTag {
+		return true
+	}
+	return c.ProtectedTags != nil && c.ProtectedTags.MatchString(tag)
+}
+
 // reposFor returns the image repositories of a chart, without duplicates.
 func (c config) reposFor(chart string) []string {
 	repos := []string{c.ImageRepoPrefix + chart}
@@ -201,9 +232,11 @@ func (c config) reposFor(chart string) []string {
 // HMAC verification
 // ---------------------------------------------------------------------------
 
-func verifySignature(secret string, body []byte, signature string) bool {
+// verifySignature checks the HMAC signature of body. Without a secret it
+// accepts the request only when allowUnsigned is true.
+func verifySignature(secret string, allowUnsigned bool, body []byte, signature string) bool {
 	if secret == "" {
-		return true
+		return allowUnsigned
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
@@ -315,12 +348,24 @@ func newHandler(cfg config, reg registryClient, ci ciProvider) *handler {
 }
 
 // processChart makes sure the images of one chart are ready.
-func (h *handler) processChart(ctx context.Context, chart ChartRef, branch string, log logFunc) error {
-	tag := chart.ImageTag
-	if tag == "" {
-		tag = sanitizeImageTag(branch)
+func (h *handler) processChart(ctx context.Context, chart ChartRef, branch, tag string, log logFunc) error {
+	// Check all input before the first registry or ADO call.
+	if !validBranch(branch) {
+		return fmt.Errorf("branch %q is not allowed: use only letters, digits, '.', '_', '-' and '/', no '..', and no leading '-' or '/'", branch)
+	}
+	if !validTag(tag) {
+		return fmt.Errorf("image tag %q is not a valid tag", tag)
 	}
 	repos := h.cfg.reposFor(chart.Name)
+	for _, repo := range repos {
+		if !validRepo(repo) {
+			return fmt.Errorf("image repository %q is not a valid repository name", repo)
+		}
+	}
+
+	if h.cfg.isProtected(tag) {
+		return h.checkProtected(ctx, repos, tag, log)
+	}
 
 	if h.cfg.DefaultBranches[branch] {
 		return h.aliasRepos(ctx, repos, tag, fmt.Sprintf("branch %q is a default branch", branch), log)
@@ -331,6 +376,9 @@ func (h *handler) processChart(ctx context.Context, chart ChartRef, branch strin
 		// The gate cannot check the branch. Build, as before.
 		log("Source repo %q is not an Azure DevOps Git URL; assuming branch %q exists", chart.SourceRepoURL, branch)
 	} else {
+		if h.cfg.ADOOrg != "" && !strings.EqualFold(src.Org, h.cfg.ADOOrg) {
+			return fmt.Errorf("source repo organization %q is not ADO_ORG %q; the gate checks branches only in ADO_ORG", src.Org, h.cfg.ADOOrg)
+		}
 		exists, err := h.ci.branchExists(ctx, src, branch)
 		if err != nil {
 			return fmt.Errorf("check branch %q in %s/%s: %w", branch, src.Project, src.Repo, err)
@@ -342,33 +390,52 @@ func (h *handler) processChart(ctx context.Context, chart ChartRef, branch strin
 	return h.ensureBuilt(ctx, chart, repos, branch, tag, log)
 }
 
-// aliasRepos makes repo:tag point to repo:FALLBACK_TAG in each repo.
-func (h *handler) aliasRepos(ctx context.Context, repos []string, tag, reason string, log logFunc) error {
-	fallback := h.cfg.FallbackTag
+// checkProtected allows a protected tag only when it exists in each repo.
+// The gate never aliases or builds a protected tag.
+func (h *handler) checkProtected(ctx context.Context, repos []string, tag string, log logFunc) error {
 	for _, repo := range repos {
-		fb, err := h.registry.getManifest(ctx, repo, fallback)
-		if err != nil {
-			return err
-		}
 		cur, err := h.registry.headDigest(ctx, repo, tag)
 		if err != nil {
 			return err
 		}
-		if fb == nil {
-			if cur != "" {
-				log("WARNING: %s:%s does not exist; keeping %s:%s (%s)", repo, fallback, repo, tag, shortDigest(cur))
-				continue
-			}
+		if cur == "" {
+			return fmt.Errorf("%s:%s does not exist; %q is a protected tag, so the gate does not create or build it", repo, tag, tag)
+		}
+		log("Image %s:%s found (protected tag, %s)", repo, tag, shortDigest(cur))
+	}
+	return nil
+}
+
+// aliasRepos makes repo:tag an alias of repo:FALLBACK_TAG in each repo.
+// It never overwrites an existing tag that holds a different image: that
+// image can be a real build, and a manifest copy carries no marker that
+// tells an old alias from a real image.
+func (h *handler) aliasRepos(ctx context.Context, repos []string, tag, reason string, log logFunc) error {
+	fallback := h.cfg.FallbackTag
+	for _, repo := range repos {
+		cur, err := h.registry.headDigest(ctx, repo, tag)
+		if err != nil {
+			return err
+		}
+		fb, err := h.registry.getManifest(ctx, repo, fallback)
+		if err != nil {
+			return err
+		}
+		switch {
+		case fb == nil && cur == "":
 			return fmt.Errorf("%s:%s does not exist and fallback %s:%s does not exist", repo, tag, repo, fallback)
-		}
-		if cur == fb.digest {
+		case fb == nil:
+			log("WARNING: %s:%s does not exist; keeping existing %s:%s (%s)", repo, fallback, repo, tag, shortDigest(cur))
+		case cur == fb.digest:
 			log("%s; %s:%s already points to %s (%s)", reason, repo, tag, fallback, shortDigest(fb.digest))
-			continue
+		case cur != "":
+			log("%s; keeping existing %s:%s (%s)", reason, repo, tag, shortDigest(cur))
+		default:
+			if err := h.registry.putManifest(ctx, repo, tag, fb); err != nil {
+				return fmt.Errorf("alias %s:%s to %s: %w", repo, tag, fallback, err)
+			}
+			log("%s; tagged %s:%s as alias of %s (%s)", reason, repo, tag, fallback, shortDigest(fb.digest))
 		}
-		if err := h.registry.putManifest(ctx, repo, tag, fb); err != nil {
-			return fmt.Errorf("alias %s:%s to %s: %w", repo, tag, fallback, err)
-		}
-		log("%s; tagged %s:%s as alias of %s (%s)", reason, repo, tag, fallback, shortDigest(fb.digest))
 	}
 	return nil
 }
@@ -420,13 +487,18 @@ func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []strin
 		return err
 	}
 
+	// The build must have pushed a new image for every repo of the chart.
 	for _, repo := range repos {
 		cur, err := h.registry.headDigest(ctx, repo, tag)
 		if err != nil {
 			return err
 		}
-		if cur == "" {
-			return fmt.Errorf("build #%d succeeded but %s:%s does not exist: %s", build.ID, repo, tag, h.link(build))
+		fb, err := h.registry.headDigest(ctx, repo, h.cfg.FallbackTag)
+		if err != nil {
+			return err
+		}
+		if cur == "" || cur == fb {
+			return fmt.Errorf("build #%d succeeded but the pipeline did not push imageTag %s to %s: %s", build.ID, tag, repo, h.link(build))
 		}
 		h.cache.markVerified(repo, tag)
 	}
@@ -460,6 +532,10 @@ func (h *handler) findOrQueueBuild(ctx context.Context, pipelineID int, branch, 
 	return b, nil
 }
 
+// maxPollErrors is the number of failed status reads in a row after which
+// the gate stops waiting for a build.
+const maxPollErrors = 5
+
 // waitForBuild polls a build until it completes, fails or times out.
 func (h *handler) waitForBuild(ctx context.Context, b *buildInfo, chart string, log logFunc) error {
 	ctx, cancel := context.WithTimeout(ctx, h.cfg.BuildTimeout)
@@ -468,6 +544,7 @@ func (h *handler) waitForBuild(ctx context.Context, b *buildInfo, chart string, 
 	start := time.Now()
 	ticker := time.NewTicker(h.cfg.PollInterval)
 	defer ticker.Stop()
+	pollErrors := 0
 
 	for {
 		select {
@@ -481,9 +558,17 @@ func (h *handler) waitForBuild(ctx context.Context, b *buildInfo, chart string, 
 
 		cur, err := h.ci.getBuild(ctx, b.ID)
 		if err != nil {
+			if ctx.Err() != nil {
+				continue // the select above reports it
+			}
+			pollErrors++
+			if pollErrors >= maxPollErrors {
+				return fmt.Errorf("cannot read build #%d for %s %d times in a row: %v: %s", b.ID, chart, pollErrors, err, h.link(b))
+			}
 			log("WARNING: cannot read build #%d: %v", b.ID, err)
 			continue
 		}
+		pollErrors = 0
 		elapsed := time.Since(start).Truncate(time.Second)
 		if cur.Status != "completed" {
 			log("Build #%d for %s: %s (%s)", b.ID, chart, cur.Status, elapsed)
@@ -516,7 +601,7 @@ func (h *handler) hookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sig := r.Header.Get("X-StackManager-Signature")
-	if !verifySignature(h.cfg.Secret, body, sig) {
+	if !verifySignature(h.cfg.Secret, h.cfg.AllowUnsigned, body, sig) {
 		http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
 		return
 	}
@@ -580,18 +665,22 @@ func (h *handler) hookHandler(w http.ResponseWriter, r *http.Request) {
 		if branch == "" {
 			continue
 		}
-		if reason := skipReason(chart, branch); reason != "" {
+		tag := chart.ImageTag
+		if tag == "" {
+			tag = sanitizeImageTag(branch)
+		}
+		if reason := skipReason(chart, tag); reason != "" {
 			logLine("[%s] Skipped: %s", chart.Name, reason)
 			continue
 		}
 
 		wg.Add(1)
-		go func(chart ChartRef, branch string) {
+		go func(chart ChartRef, branch, tag string) {
 			defer wg.Done()
 			chartLog := func(format string, args ...any) {
 				logLine("[%s] "+format, append([]any{chart.Name}, args...)...)
 			}
-			err := h.processChart(ctx, chart, branch, chartLog)
+			err := h.processChart(ctx, chart, branch, tag, chartLog)
 			if err == nil {
 				return
 			}
@@ -605,7 +694,7 @@ func (h *handler) hookHandler(w http.ResponseWriter, r *http.Request) {
 			chartLog("ERROR: %v", err)
 			failures = append(failures, fmt.Sprintf("%s: %v", chart.Name, err))
 			cancel()
-		}(chart, branch)
+		}(chart, branch, tag)
 	}
 	wg.Wait()
 
@@ -670,7 +759,7 @@ func main() {
 	}
 
 	if cfg.Secret == "" {
-		slog.Warn("CI_TRIGGER_WEBHOOK_SECRET not set — signature verification disabled")
+		slog.Warn("WARNING: CI_TRIGGER_WEBHOOK_SECRET is not set and ALLOW_UNSIGNED=true — the gate accepts unsigned requests from anyone who can reach it")
 	}
 
 	// The credential reads AZURE_CLIENT_ID, AZURE_TENANT_ID and
@@ -702,6 +791,7 @@ func main() {
 		"poll_interval", cfg.PollInterval,
 		"build_timeout", cfg.BuildTimeout,
 		"cache_ttl", cfg.CacheTTL,
+		"shutdown_timeout", cfg.ShutdownTimeout,
 	)
 
 	server := &http.Server{
@@ -714,8 +804,51 @@ func main() {
 		IdleTimeout: 30 * time.Second,
 	}
 
-	if err := server.ListenAndServe(); err != nil {
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		slog.Error("listen", "error", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	if err := serve(ctx, server, ln, cfg.ShutdownTimeout); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// serve runs srv until ctx is done. Then it stops new requests and gives
+// in-flight hooks up to timeout to finish. After the timeout it cancels the
+// request contexts, so a hook that waits for a build denies the deploy and
+// returns.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, timeout time.Duration) error {
+	hookCtx, cancelHooks := context.WithCancel(context.Background())
+	defer cancelHooks()
+	srv.BaseContext = func(net.Listener) context.Context { return hookCtx }
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(ln) }()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
+
+	slog.Info("shutting down", "timeout", timeout)
+	sctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := srv.Shutdown(sctx); err == nil {
+		return nil
+	}
+
+	slog.Warn("in-flight hooks did not finish in time; stopping them")
+	cancelHooks()
+	sctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if err := srv.Shutdown(sctx2); err != nil {
+		return srv.Close()
+	}
+	return nil
 }
