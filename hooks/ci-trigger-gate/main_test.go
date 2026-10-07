@@ -176,6 +176,9 @@ func TestLoadConfig(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if cfg.AliasMarkerSuffix != ".alias" {
+			t.Errorf("AliasMarkerSuffix = %q", cfg.AliasMarkerSuffix)
+		}
 		if cfg.ShutdownTimeout != 30*time.Second || cfg.AllowUnsigned {
 			t.Errorf("ShutdownTimeout = %s, AllowUnsigned = %v", cfg.ShutdownTimeout, cfg.AllowUnsigned)
 		}
@@ -255,6 +258,9 @@ func TestLoadConfig(t *testing.T) {
 		{"ADO_AUTH": "basic"},
 		{"PROTECTED_TAGS": "("},
 		{"FALLBACK_TAG": "bad tag"},
+		{"ALIAS_MARKER_SUFFIX": "alias"},
+		{"ALIAS_MARKER_SUFFIX": ".al/ias"},
+		{"ALIAS_MARKER_SUFFIX": "." + strings.Repeat("a", 40)},
 	} {
 		bad := bad
 		t.Run("invalid "+strings.Join(keys(bad), ","), func(t *testing.T) {
@@ -407,6 +413,15 @@ func TestHook_AliasCreatedForMissingBranch(t *testing.T) {
 	if ct := e.acr.contentType("dev/api", "feature-x"); ct != ociIndexType {
 		t.Errorf("alias content type = %q", ct)
 	}
+	if ct := e.acr.contentType("dev/api", "feature-x.alias"); ct != ociIndexType {
+		t.Errorf("marker content type = %q", ct)
+	}
+	if got := strings.Join(e.acr.putList(), ","); got != "dev/api:feature-x.alias,dev/api:feature-x" {
+		t.Errorf("PUT order = %s, want marker first", got)
+	}
+	if e.acr.digest("dev/api", "feature-x.alias") != e.acr.digest("dev/api", "feature-x") {
+		t.Error("marker digest differs from the alias")
+	}
 	if !strings.Contains(res.logText(), "does not exist") || !strings.Contains(res.logText(), "alias of latest-dev") {
 		t.Errorf("missing alias log:\n%s", res.logText())
 	}
@@ -420,6 +435,7 @@ func TestHook_AliasSkippedWhenDigestEqual(t *testing.T) {
 	e := newTestEnv(t, nil)
 	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
 	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback"}`)
 
 	res := e.post(t, envelope("", appChart("api", "feature/x")))
 	if !res.resp.Allowed {
@@ -596,11 +612,126 @@ func TestHook_TagEqualsFallbackNeverBuilds(t *testing.T) {
 	}
 }
 
+func TestHook_AliasFollowsMovedFallback(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback-v2"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback-v1"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback-v1"}`)
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	want := e.acr.digest("dev/api", "latest-dev")
+	if e.acr.digest("dev/api", "feature-x") != want || e.acr.digest("dev/api", "feature-x.alias") != want {
+		t.Error("alias and marker do not follow the moved fallback")
+	}
+	if got := strings.Join(e.acr.putList(), ","); got != "dev/api:feature-x.alias,dev/api:feature-x" {
+		t.Errorf("PUT order = %s, want marker first", got)
+	}
+	if !strings.Contains(res.logText(), "moved alias dev/api:feature-x") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_AliasThenBranchCreatedBuilds(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// An old alias. The fallback moved since then.
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback-v2"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback-v1"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback-v1"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.onQueueSuccess = func(tag string) { e.acr.push("dev/api", tag, dockerV2Type, `{"m":"built"}`) }
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 1 {
+		t.Fatalf("resp = %+v, queued = %d\n%s", res.resp, e.ado.queuedCount(), res.logText())
+	}
+	if !strings.Contains(res.logText(), "former alias") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_UnmarkedTagEqualToFallbackAllows(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// CI pushed the same image for the branch and the fallback. No marker.
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"same"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"same"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 0 {
+		t.Errorf("resp = %+v, queued = %d", res.resp, e.ado.queuedCount())
+	}
+}
+
+func TestHook_StaleMarkerMeansRealImage(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// A build replaced the alias. The old marker stays with the old digest.
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback-v2"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"built"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback-v1"}`)
+
+	// The branch is gone now: the real image is kept, not moved.
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.acr.putCount() != 0 || !strings.Contains(res.logText(), "keeping existing dev/api:feature-x") {
+		t.Errorf("resp = %+v, puts = %d\n%s", res.resp, e.acr.putCount(), res.logText())
+	}
+
+	// The branch exists: the real image is used, no build.
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.h.cache = newImageCache(0)
+	res = e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 0 {
+		t.Errorf("resp = %+v, queued = %d", res.resp, e.ado.queuedCount())
+	}
+}
+
+func TestMarkerTag(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	if got := cfg.markerTag("feature-x"); got != "feature-x.alias" {
+		t.Errorf("markerTag = %q", got)
+	}
+	long := strings.Repeat("a", 125)
+	long2 := strings.Repeat("a", 124) + "b"
+	m1, m2 := cfg.markerTag(long), cfg.markerTag(long2)
+	if len(m1) != maxTagLength || !validTag(m1) || !strings.HasSuffix(m1, ".alias") {
+		t.Errorf("markerTag(long) = %q (len %d)", m1, len(m1))
+	}
+	if m1 == m2 {
+		t.Error("two long tags with the same prefix share one marker")
+	}
+	if cfg.markerTag(long) != m1 {
+		t.Error("markerTag is not deterministic")
+	}
+	exact := strings.Repeat("a", 122) // 122 + 6 = 128: no cut
+	if got := cfg.markerTag(exact); got != exact+".alias" {
+		t.Errorf("markerTag(exact) = %q", got)
+	}
+}
+
+func TestHook_MarkerTagIsProtected(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	chart := appChart("api", "feature/x.alias")
+	res := e.post(t, envelope("", chart))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "protected tag") || e.acr.putCount() != 0 {
+		t.Errorf("resp = %+v, puts = %d", res.resp, e.acr.putCount())
+	}
+}
+
 func TestHook_BuildDidNotPushDenies(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t, nil)
 	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
 	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback"}`) // alias
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback"}`)
 	e.ado.refs["org/proj/api"] = []string{"feature/x"}
 	// The build succeeds but pushes nothing. The tag is still the alias.
 
@@ -735,6 +866,7 @@ func TestHook_StaleAliasTriggersBuild(t *testing.T) {
 	e := newTestEnv(t, nil)
 	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
 	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback"}`) // old alias
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback"}`)
 	e.ado.refs["org/proj/api"] = []string{"feature/x"}
 	e.ado.onQueueSuccess = func(tag string) { e.acr.push("dev/api", tag, dockerV2Type, `{"m":"built"}`) }
 
@@ -753,7 +885,7 @@ func TestHook_StaleAliasTriggersBuild(t *testing.T) {
 	if e.acr.digest("dev/api", "feature-x") != digestOf([]byte(`{"m":"built"}`)) {
 		t.Error("tag does not hold the built image")
 	}
-	for _, want := range []string{"is an alias of latest-dev", "Queued build #101", "https://ado.example/build/101", "succeeded"} {
+	for _, want := range []string{"is a former alias of latest-dev", "Queued build #101", "https://ado.example/build/101", "succeeded"} {
 		if !strings.Contains(res.logText(), want) {
 			t.Errorf("logs do not contain %q:\n%s", want, res.logText())
 		}

@@ -112,6 +112,12 @@ func (f *fakeACR) contentType(repo, tag string) string {
 	return f.manifests[repo][tag].contentType
 }
 
+func (f *fakeACR) putList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.puts...)
+}
+
 func (f *fakeACR) putCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -414,6 +420,7 @@ func testConfig() config {
 		PipelineSourceBranch: "refs/heads/main",
 		ProtectedTags:        regexp.MustCompile(defaultProtectedTags),
 		AllowUnsigned:        true,
+		AliasMarkerSuffix:    ".alias",
 		PollInterval:         5 * time.Millisecond,
 		BuildTimeout:         5 * time.Second,
 		CacheTTL:             time.Minute,

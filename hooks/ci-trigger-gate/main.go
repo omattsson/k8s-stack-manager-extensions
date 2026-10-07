@@ -100,6 +100,7 @@ type config struct {
 	ImageRepoPrefix      string
 	FallbackTag          string
 	PipelineSourceBranch string
+	AliasMarkerSuffix    string
 	PollInterval         time.Duration
 	BuildTimeout         time.Duration
 	CacheTTL             time.Duration
@@ -130,6 +131,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		ImageRepoPrefix:      get("IMAGE_REPO_PREFIX", ""),
 		FallbackTag:          get("FALLBACK_TAG", "latest-dev"),
 		PipelineSourceBranch: get("PIPELINE_SOURCE_BRANCH", "refs/heads/main"),
+		AliasMarkerSuffix:    get("ALIAS_MARKER_SUFFIX", ".alias"),
 		PollInterval:         time.Duration(envInt(get, "POLL_INTERVAL_SECONDS", 15, 1)) * time.Second,
 		BuildTimeout:         time.Duration(envInt(get, "BUILD_TIMEOUT_MINUTES", 25, 1)) * time.Minute,
 		CacheTTL:             time.Duration(envInt(get, "CACHE_TTL_MINUTES", 5, 0)) * time.Minute,
@@ -143,6 +145,10 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if !validTag(cfg.FallbackTag) {
 		return config{}, fmt.Errorf("FALLBACK_TAG %q is not a valid image tag", cfg.FallbackTag)
+	}
+
+	if !validMarkerSuffix(cfg.AliasMarkerSuffix) {
+		return config{}, fmt.Errorf("ALIAS_MARKER_SUFFIX %q must start with '.', '-' or '_', use only letters, digits, '.', '_' and '-', and have at most %d characters", cfg.AliasMarkerSuffix, maxMarkerSuffix)
 	}
 
 	protected, err := regexp.Compile(get("PROTECTED_TAGS", defaultProtectedTags))
@@ -206,12 +212,28 @@ func parseExtraImages(s string) (map[string][]string, error) {
 }
 
 // isProtected reports whether the gate must never alias or build tag.
-// FALLBACK_TAG is always protected.
+// FALLBACK_TAG and alias marker tags are always protected.
 func (c config) isProtected(tag string) bool {
 	if tag == c.FallbackTag {
 		return true
 	}
+	if c.AliasMarkerSuffix != "" && strings.HasSuffix(tag, c.AliasMarkerSuffix) {
+		return true
+	}
 	return c.ProtectedTags != nil && c.ProtectedTags.MatchString(tag)
+}
+
+// markerTag returns the alias marker tag of tag: tag + ALIAS_MARKER_SUFFIX.
+// When the result is longer than 128 characters, the tag part is cut and
+// gets "-" and the first 8 hex characters of the SHA-256 of the full tag,
+// so the marker stays valid and unique.
+func (c config) markerTag(tag string) string {
+	if len(tag)+len(c.AliasMarkerSuffix) <= maxTagLength {
+		return tag + c.AliasMarkerSuffix
+	}
+	sum := sha256.Sum256([]byte(tag))
+	keep := maxTagLength - len(c.AliasMarkerSuffix) - 9
+	return tag[:keep] + "-" + hex.EncodeToString(sum[:4]) + c.AliasMarkerSuffix
 }
 
 // reposFor returns the image repositories of a chart, without duplicates.
@@ -406,10 +428,36 @@ func (h *handler) checkProtected(ctx context.Context, repos []string, tag string
 	return nil
 }
 
+// isGateAlias reports whether repo:tag (with the given digest) is an alias
+// that the gate made. It is when the marker tag exists and has the same
+// digest. A marker with another digest is stale and does not count.
+func (h *handler) isGateAlias(ctx context.Context, repo, tag, digest string) (bool, error) {
+	if digest == "" {
+		return false, nil
+	}
+	m, err := h.registry.headDigest(ctx, repo, h.cfg.markerTag(tag))
+	if err != nil {
+		return false, err
+	}
+	return m == digest, nil
+}
+
+// putAlias points the marker tag and repo:tag to fb. The marker comes first,
+// so a failure between the two writes never leaves an unmarked alias.
+func (h *handler) putAlias(ctx context.Context, repo, tag string, fb *manifest) error {
+	marker := h.cfg.markerTag(tag)
+	if err := h.registry.putManifest(ctx, repo, marker, fb); err != nil {
+		return fmt.Errorf("write alias marker %s:%s: %w", repo, marker, err)
+	}
+	if err := h.registry.putManifest(ctx, repo, tag, fb); err != nil {
+		return fmt.Errorf("alias %s:%s to %s: %w", repo, tag, h.cfg.FallbackTag, err)
+	}
+	return nil
+}
+
 // aliasRepos makes repo:tag an alias of repo:FALLBACK_TAG in each repo.
-// It never overwrites an existing tag that holds a different image: that
-// image can be a real build, and a manifest copy carries no marker that
-// tells an old alias from a real image.
+// It creates a missing tag, and moves an alias that the gate made when the
+// fallback moved. It never overwrites a real image.
 func (h *handler) aliasRepos(ctx context.Context, repos []string, tag, reason string, log logFunc) error {
 	fallback := h.cfg.FallbackTag
 	for _, repo := range repos {
@@ -421,27 +469,41 @@ func (h *handler) aliasRepos(ctx context.Context, repos []string, tag, reason st
 		if err != nil {
 			return err
 		}
-		switch {
-		case fb == nil && cur == "":
-			return fmt.Errorf("%s:%s does not exist and fallback %s:%s does not exist", repo, tag, repo, fallback)
-		case fb == nil:
+		if fb == nil {
+			if cur == "" {
+				return fmt.Errorf("%s:%s does not exist and fallback %s:%s does not exist", repo, tag, repo, fallback)
+			}
 			log("WARNING: %s:%s does not exist; keeping existing %s:%s (%s)", repo, fallback, repo, tag, shortDigest(cur))
-		case cur == fb.digest:
-			log("%s; %s:%s already points to %s (%s)", reason, repo, tag, fallback, shortDigest(fb.digest))
-		case cur != "":
-			log("%s; keeping existing %s:%s (%s)", reason, repo, tag, shortDigest(cur))
-		default:
-			if err := h.registry.putManifest(ctx, repo, tag, fb); err != nil {
-				return fmt.Errorf("alias %s:%s to %s: %w", repo, tag, fallback, err)
+			continue
+		}
+		if cur == "" {
+			if err := h.putAlias(ctx, repo, tag, fb); err != nil {
+				return err
 			}
 			log("%s; tagged %s:%s as alias of %s (%s)", reason, repo, tag, fallback, shortDigest(fb.digest))
+			continue
+		}
+		alias, err := h.isGateAlias(ctx, repo, tag, cur)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !alias:
+			log("%s; keeping existing %s:%s (%s)", reason, repo, tag, shortDigest(cur))
+		case cur == fb.digest:
+			log("%s; %s:%s already points to %s (%s)", reason, repo, tag, fallback, shortDigest(fb.digest))
+		default:
+			if err := h.putAlias(ctx, repo, tag, fb); err != nil {
+				return err
+			}
+			log("%s; moved alias %s:%s from %s to %s (%s)", reason, repo, tag, shortDigest(cur), fallback, shortDigest(fb.digest))
 		}
 	}
 	return nil
 }
 
 // ensureBuilt makes sure a branch image exists in each repo. It queues or
-// reuses a build when an image is missing or is still the fallback alias.
+// reuses a build when an image is missing or is an alias that the gate made.
 func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []string, branch, tag string, log logFunc) error {
 	pipelineID, err := strconv.Atoi(chart.BuildPipelineID)
 	if err != nil {
@@ -463,12 +525,12 @@ func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []strin
 			needBuild = true
 			continue
 		}
-		fb, err := h.registry.headDigest(ctx, repo, h.cfg.FallbackTag)
+		alias, err := h.isGateAlias(ctx, repo, tag, cur)
 		if err != nil {
 			return err
 		}
-		if cur == fb {
-			log("Image %s:%s is an alias of %s; a branch build is needed", repo, tag, h.cfg.FallbackTag)
+		if alias {
+			log("Image %s:%s is a former alias of %s; a branch build replaces it", repo, tag, h.cfg.FallbackTag)
 			needBuild = true
 			continue
 		}
@@ -488,16 +550,17 @@ func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []strin
 	}
 
 	// The build must have pushed a new image for every repo of the chart.
+	// The old marker can stay: it no longer matches the tag, so it is harmless.
 	for _, repo := range repos {
 		cur, err := h.registry.headDigest(ctx, repo, tag)
 		if err != nil {
 			return err
 		}
-		fb, err := h.registry.headDigest(ctx, repo, h.cfg.FallbackTag)
+		alias, err := h.isGateAlias(ctx, repo, tag, cur)
 		if err != nil {
 			return err
 		}
-		if cur == "" || cur == fb {
+		if cur == "" || alias {
 			return fmt.Errorf("build #%d succeeded but the pipeline did not push imageTag %s to %s: %s", build.ID, tag, repo, h.link(build))
 		}
 		h.cache.markVerified(repo, tag)

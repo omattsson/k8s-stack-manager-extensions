@@ -19,17 +19,17 @@ For each chart:
    - the branch has characters other than letters, digits, `.`, `_`, `-` and `/`, contains `..`, starts with `-` or `/`, or is longer than 250 characters;
    - the tag or a repo name is not valid for a container registry.
 4. **Repos.** The chart's image repos are `IMAGE_REPO_PREFIX` + chart name, plus the extra repos from `CHART_EXTRA_IMAGES`.
-5. **Protected tags.** If the tag is `FALLBACK_TAG` or matches `PROTECTED_TAGS` (default: `latest` and release versions), the gate never aliases or builds it. It allows the deploy if the tag exists in each repo, and denies it if not.
+5. **Protected tags.** If the tag is `FALLBACK_TAG`, ends with `ALIAS_MARKER_SUFFIX`, or matches `PROTECTED_TAGS` (default: `latest` and release versions), the gate never aliases or builds it. It allows the deploy if the tag exists in each repo, and denies it if not.
 6. **Branch check.** The gate parses `source_repo_url` and asks the ADO Git refs API if `refs/heads/<branch>` exists. Only an exact name match counts. Branches in `DEFAULT_BRANCHES` count as default, also when they exist. When `ADO_ORG` is set, the organization in `source_repo_url` must be `ADO_ORG` (case-insensitive), else the deploy is denied. The project can differ.
 7. **Branch does not exist, or is a default branch:** for each repo:
-   - `<repo>:<tag>` does not exist: the gate copies the manifest of `<repo>:<FALLBACK_TAG>` to `<repo>:<tag>` (an alias).
-   - `<repo>:<tag>` has the fallback digest: nothing to do.
-   - `<repo>:<tag>` has a different digest: the gate keeps it (`keeping existing <repo>:<tag>`). It never overwrites an existing tag, because it cannot tell an old alias from a real image. This also keeps the default-branch images that CI publishes (for example `:main`).
-8. **Branch exists:** for each repo, the image is ready when `<repo>:<tag>` exists and its digest is not the fallback digest. If an image is missing or is still an alias, the gate:
+   - `<repo>:<tag>` does not exist: the gate creates an alias (see [Alias markers](#alias-markers)).
+   - `<repo>:<tag>` is an alias that the gate made: the gate moves it to the current fallback image if the fallback moved. Otherwise nothing changes.
+   - `<repo>:<tag>` is a real image: the gate keeps it (`keeping existing <repo>:<tag>`). It never overwrites a real image. This also keeps the default-branch images that CI publishes (for example `:main`).
+8. **Branch exists:** for each repo, a real image under `<repo>:<tag>` is ready, also when it has the same digest as the fallback (CI can build the same commit for both). If the tag is missing or is an alias that the gate made, the gate:
    - reuses a running build of the same pipeline whose `imageTag` template parameter is the tag, or
    - queues a new build with template parameters `branch` and `imageTag`, on the pipeline repo ref `PIPELINE_SOURCE_BRANCH`.
 
-   The gate polls the build and streams progress. It denies the deploy when the build fails, is canceled, does not finish within `BUILD_TIMEOUT_MINUTES`, or when 5 status reads in a row fail. The message includes the build URL. After a successful build, every repo of the chart must have the tag with a digest that is not the fallback digest. Otherwise the gate denies the deploy, because the pipeline did not push `imageTag`.
+   The gate polls the build and streams progress. It denies the deploy when the build fails, is canceled, does not finish within `BUILD_TIMEOUT_MINUTES`, or when 5 status reads in a row fail. The message includes the build URL. After a successful build, every repo of the chart must have the tag, and the tag must not be an alias that the gate made. Otherwise the gate denies the deploy, because the pipeline did not push `imageTag`.
 
 When one chart fails, the gate stops the other charts and denies the deploy. When the caller goes away, the gate stops polling.
 
@@ -37,12 +37,21 @@ Progress lines start with `LOG: ` and show in the deploy log. The last line is t
 
 Notes:
 
-- An alias does not follow the fallback tag. When `FALLBACK_TAG` moves to a new image, existing aliases keep the old image. To refresh an alias, delete the branch tag; the next deploy creates it again.
-- After the fallback tag moves, an old alias has a digest that is not the fallback digest. If the branch is created later, the gate sees the old alias as a real image and does not build. Delete the tag or run the pipeline by hand in that case.
 - If `source_repo_url` is not an Azure DevOps Git URL, the gate cannot check the branch. It assumes that the branch exists. The branch check in step 3 still applies.
 - If the fallback tag does not exist in a repo, and the branch tag does not exist either, the deploy is denied.
 - Images found for a branch build are cached for `CACHE_TTL_MINUTES`. Aliases are never cached.
 - Two deploys of the same branch at the same time share one build.
+
+### Alias markers
+
+The gate marks each alias that it makes with a second tag, the marker: `<tag>` + `ALIAS_MARKER_SUFFIX` (default `.alias`). Example: `dev/api:feature-x` and `dev/api:feature-x.alias`.
+
+- To create or move an alias, the gate writes the fallback manifest (same bytes, same Content-Type) to the marker first and then to `<tag>`. A failure between the two writes never leaves an unmarked alias.
+- `<repo>:<tag>` is an alias that the gate made only when the marker exists and has the same digest as `<tag>`. In all other cases the tag is a real image.
+- After a branch build replaces an alias, the old marker stays. Its digest no longer matches the tag, so it has no effect. The gate does not delete markers. The registry v2 API deletes a manifest by digest, which would also delete the image. A tag-only delete needs a registry-specific API.
+- A tag can have at most 128 characters. If `<tag>` + suffix is longer, the gate cuts the tag part and adds `-` and the first 8 hex characters of the SHA-256 of the full tag before the suffix. The result is always the same for the same tag.
+- Retention policies must treat `*<suffix>` tags like the other dev tags. If a policy deletes only the marker, the alias becomes a real image for the gate, and it is no longer moved or replaced by a build.
+- Aliases made by a gate version without markers have no marker. The gate treats them as real images. Delete those tags once.
 
 Supported `source_repo_url` forms:
 
@@ -128,6 +137,7 @@ When `REGISTRY_AUTH` or `ADO_AUTH` is not set, the gate uses workload identity i
 | `FALLBACK_TAG` | `latest-dev` | Tag that missing and default branches alias. Always protected. |
 | `PROTECTED_TAGS` | `^(latest\|v?\d+\.\d+\.\d+([.-].*)?)$` | Regular expression of tags that the gate never aliases or builds |
 | `DEFAULT_BRANCHES` | `main,master` | Branches that always use the fallback alias |
+| `ALIAS_MARKER_SUFFIX` | `.alias` | Suffix of the alias marker tag. Starts with `.`, `-` or `_`; at most 32 characters of `[a-zA-Z0-9._-]`. Tags with this suffix are protected. |
 | `PIPELINE_SOURCE_BRANCH` | `refs/heads/main` | Ref of the pipeline repo for queued builds |
 | `POLL_INTERVAL_SECONDS` | `15` | Seconds between build status polls |
 | `BUILD_TIMEOUT_MINUTES` | `25` | Maximum wait for one build |

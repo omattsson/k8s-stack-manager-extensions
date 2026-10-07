@@ -35,6 +35,7 @@ data:
   IMAGE_REPO_PREFIX: "dev/"
   CHART_EXTRA_IMAGES: ""
   FALLBACK_TAG: "latest-dev"
+  ALIAS_MARKER_SUFFIX: ".alias"
   PROTECTED_TAGS: "^(latest|v?\\d+\\.\\d+\\.\\d+([.-].*)?)$"
   DEFAULT_BRANCHES: "main,master"
   PIPELINE_SOURCE_BRANCH: "refs/heads/main"

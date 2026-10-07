@@ -75,6 +75,19 @@ var (
 	branchRe   = regexp.MustCompile(`^[A-Za-z0-9_./-]{1,250}$`)
 )
 
+// maxTagLength is the maximum length of an image tag.
+const maxTagLength = 128
+
+// maxMarkerSuffix is the maximum length of ALIAS_MARKER_SUFFIX.
+const maxMarkerSuffix = 32
+
+var markerSuffixRe = regexp.MustCompile(`^[._-][a-zA-Z0-9._-]*$`)
+
+// validMarkerSuffix reports whether s can be the alias marker suffix.
+func validMarkerSuffix(s string) bool {
+	return len(s) <= maxMarkerSuffix && markerSuffixRe.MatchString(s)
+}
+
 // validRepo reports whether s is a valid image repository name.
 func validRepo(s string) bool { return repoNameRe.MatchString(s) }
 
