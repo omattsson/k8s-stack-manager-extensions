@@ -113,11 +113,11 @@ class TestBuildAdaptiveCard(unittest.TestCase):
 
 class TestSiteDomain(unittest.TestCase):
     def test_fallback_card_uses_site_domain(self):
-        with patch.object(server, "SITE_DOMAIN", "klaravik.test"), \
+        with patch.object(server, "SITE_DOMAIN", "example.test"), \
              patch.object(server, "_card_template", None):
             card = server.build_adaptive_card(SAMPLE_ENVELOPE)
             site_action = card["attachments"][0]["content"]["actions"][0]
-            self.assertEqual(site_action["url"], "https://demo.klaravik.test")
+            self.assertEqual(site_action["url"], "https://demo.example.test")
 
     def test_fallback_card_default_domain(self):
         with patch.object(server, "SITE_DOMAIN", "localhost"), \
@@ -129,7 +129,7 @@ class TestSiteDomain(unittest.TestCase):
 
 class TestBuildTemplateVariables(unittest.TestCase):
     def test_all_keys_present(self):
-        with patch.object(server, "SITE_DOMAIN", "klaravik.test"), \
+        with patch.object(server, "SITE_DOMAIN", "example.test"), \
              patch.object(server, "STACK_MANAGER_URL", "https://sm.example"):
             variables = server.build_template_variables(SAMPLE_ENVELOPE)
         expected_keys = {
@@ -164,8 +164,8 @@ class TestBuildTemplateVariables(unittest.TestCase):
 class TestRenderTemplate(unittest.TestCase):
     def test_simple_substitution(self):
         template = '{"title": "{{name}} on {{site_domain}}"}'
-        result = server.render_template(template, {"name": "demo", "site_domain": "klaravik.test"})
-        self.assertEqual(result["title"], "demo on klaravik.test")
+        result = server.render_template(template, {"name": "demo", "site_domain": "example.test"})
+        self.assertEqual(result["title"], "demo on example.test")
 
     def test_unknown_placeholder_kept(self):
         template = '{"title": "{{unknown}}"}'
@@ -186,14 +186,14 @@ class TestRenderTemplate(unittest.TestCase):
             }],
         })
         variables = {
-            "name": "olofm",
-            "site_domain": "klaravik.test",
+            "name": "alice",
+            "site_domain": "example.test",
             "emoji": "✅",
             "outcome": "succeeded",
             "instance_url": "https://sm/stack-instances/abc",
         }
         result = server.render_template(template, variables)
-        self.assertEqual(result["attachments"][0]["content"]["actions"][0]["url"], "https://olofm.klaravik.test")
+        self.assertEqual(result["attachments"][0]["content"]["actions"][0]["url"], "https://alice.example.test")
         self.assertIn("succeeded", result["attachments"][0]["content"]["body"][0]["text"])
 
 
@@ -204,10 +204,10 @@ class TestCardTemplateIntegration(unittest.TestCase):
             "text": "{{name}} deployed to {{site_domain}}",
         })
         with patch.object(server, "_card_template", template), \
-             patch.object(server, "SITE_DOMAIN", "klaravik.test"), \
+             patch.object(server, "SITE_DOMAIN", "example.test"), \
              patch.object(server, "STACK_MANAGER_URL", "https://sm"):
             card = server.build_adaptive_card(SAMPLE_ENVELOPE)
-        self.assertEqual(card["text"], "demo deployed to klaravik.test")
+        self.assertEqual(card["text"], "demo deployed to example.test")
 
     def test_fallback_when_no_template(self):
         with patch.object(server, "_card_template", None), \

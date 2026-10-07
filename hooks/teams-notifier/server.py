@@ -14,7 +14,7 @@ a built-in Adaptive Card.
 Usage:
     export TEAMS_WEBHOOK_URL="https://your-tenant.webhook.office.com/webhookb2/..."
     export TEAMS_WEBHOOK_SECRET="your-shared-secret"
-    export SITE_DOMAIN="klaravik.test"          # optional, used in card template
+    export SITE_DOMAIN="example.test"          # optional, used in card template
     export CARD_TEMPLATE_FILE="/config/card.json" # optional, path to card template
     python3 server.py
 """
