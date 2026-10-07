@@ -6,803 +6,1117 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Pure functions
 // ---------------------------------------------------------------------------
 
-func signBody(body []byte, key string) string {
-	mac := hmac.New(sha256.New, []byte(key))
-	mac.Write(body)
-	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
-}
-
-func makeEnvelope(branch string, charts []ChartRef) EventEnvelope {
-	return EventEnvelope{
-		APIVersion: "hooks.stackmanager/v1",
-		Kind:       "EventEnvelope",
-		Event:      "pre-deploy",
-		RequestID:  "test-req-1",
-		Instance: &InstanceRef{
-			ID:        "inst-1",
-			Name:      "test-instance",
-			Namespace: "stack-test",
-			Branch:    branch,
-		},
-		Deployment: &DeploymentRef{ID: "dep-1"},
-		Charts:     charts,
+// TestSanitizeImageTag uses the same table as TestSanitizeImageTag in
+// k8s-stack-manager (backend/internal/helm/values_generator_test.go), plus
+// the length limit.
+func TestSanitizeImageTag(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		branch string
+		want   string
+	}{
+		{"master", "master"},
+		{"main", "main"},
+		{"feature/my-thing", "feature-my-thing"},
+		{"feature/UPPER-Case", "feature-upper-case"},
+		{"bugfix/fix_underscore", "bugfix-fix-underscore"},
+		{"refs/heads/feature/test", "refs-heads-feature-test"},
+		{"branch with spaces", "branch-with-spaces"},
+		{"--leading-dashes", "leading-dashes"},
+		{"..leading-dots", "leading-dots"},
+		{"v1.2.3", "v1.2.3"},
+		{"", "latest"},
+		{"a/b/c/d/e", "a-b-c-d-e"},
+		{strings.Repeat("a", 140), strings.Repeat("a", 128)},
+		{"trailing-", "trailing-"},
+		{"!!!", "latest"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.branch, func(t *testing.T) {
+			t.Parallel()
+			if got := sanitizeImageTag(tt.branch); got != tt.want {
+				t.Errorf("sanitizeImageTag(%q) = %q, want %q", tt.branch, got, tt.want)
+			}
+		})
 	}
 }
 
-func postHook(t *testing.T, handler http.HandlerFunc, body []byte, sig string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader(string(body)))
-	if sig != "" {
-		req.Header.Set("X-StackManager-Signature", sig)
+func TestParseADORepoURL(t *testing.T) {
+	t.Parallel()
+	want := adoRepo{Org: "myorg", Project: "My Project", Repo: "my-repo"}
+	tests := []struct {
+		name string
+		url  string
+		want adoRepo
+		ok   bool
+	}{
+		{"dev.azure.com", "https://dev.azure.com/myorg/My%20Project/_git/my-repo", want, true},
+		{"user at dev.azure.com", "https://myorg@dev.azure.com/myorg/My%20Project/_git/my-repo", want, true},
+		{"trailing slash and .git", "https://dev.azure.com/myorg/My%20Project/_git/my-repo.git/", want, true},
+		{"query and extra path", "https://dev.azure.com/myorg/My%20Project/_git/my-repo/branches?x=1", want, true},
+		{"visualstudio.com", "https://myorg.visualstudio.com/My%20Project/_git/my-repo", want, true},
+		{"visualstudio.com DefaultCollection", "https://myorg.visualstudio.com/DefaultCollection/My%20Project/_git/my-repo", want, true},
+		{"ssh", "git@ssh.dev.azure.com:v3/myorg/My%20Project/my-repo", want, true},
+		{"gitlab", "https://gitlab.com/group/repo.git", adoRepo{}, false},
+		{"github", "https://github.com/org/repo", adoRepo{}, false},
+		{"no _git", "https://dev.azure.com/myorg/proj/repo", adoRepo{}, false},
+		{"empty", "", adoRepo{}, false},
+		{"not a url", "::::", adoRepo{}, false},
 	}
-	rr := httptest.NewRecorder()
-	handler(rr, req)
-	return rr
-}
-
-// ---------------------------------------------------------------------------
-// Mock CI provider
-// ---------------------------------------------------------------------------
-
-type mockCI struct {
-	mu             sync.Mutex
-	runningBuilds  map[string]string // pipelineID+branch → buildID
-	triggeredCount int
-	builds         map[string]struct{ status, result string }
-}
-
-func newMockCI() *mockCI {
-	return &mockCI{
-		runningBuilds: make(map[string]string),
-		builds:        make(map[string]struct{ status, result string }),
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := parseADORepoURL(tt.url)
+			if ok != tt.ok || got != tt.want {
+				t.Errorf("parseADORepoURL(%q) = %+v, %v; want %+v, %v", tt.url, got, ok, tt.want, tt.ok)
+			}
+		})
 	}
-}
-
-func (m *mockCI) findRunningBuild(_ context.Context, pipelineID, branch string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	id, ok := m.runningBuilds[pipelineID+"/"+branch]
-	if !ok {
-		return "", nil
-	}
-	return id, nil
-}
-
-func (m *mockCI) triggerBuild(_ context.Context, pipelineID, branch, imageTag string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.triggeredCount++
-	id := fmt.Sprintf("build-%d", m.triggeredCount)
-	if _, exists := m.builds[id]; !exists {
-		m.builds[id] = struct{ status, result string }{"completed", "succeeded"}
-	}
-	return id, nil
-}
-
-func (m *mockCI) getBuildStatus(_ context.Context, buildID string) (string, string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	b, ok := m.builds[buildID]
-	if !ok {
-		return "", "", fmt.Errorf("build %s not found", buildID)
-	}
-	return b.status, b.result, nil
-}
-
-func (m *mockCI) setBuildResult(buildID, status, result string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.builds[buildID] = struct{ status, result string }{status, result}
-}
-
-// ---------------------------------------------------------------------------
-// Mock registry
-// ---------------------------------------------------------------------------
-
-type mockRegistry struct {
-	mu     sync.Mutex
-	images map[string]bool // "repo:tag" → exists
-}
-
-func newMockRegistry() *mockRegistry {
-	return &mockRegistry{images: make(map[string]bool)}
-}
-
-func (m *mockRegistry) setImage(repo, tag string, exists bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.images[repo+":"+tag] = exists
-}
-
-func (m *mockRegistry) imageExists(_ context.Context, repo, tag string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.images[repo+":"+tag], nil
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-func TestHealthHandler(t *testing.T) {
-	origReg := registryURL
-	origPAT := adoPAT
-	defer func() { registryURL = origReg; adoPAT = origPAT }()
-
-	t.Run("configured", func(t *testing.T) {
-		registryURL = "myacr.azurecr.io"
-		adoPAT = "test-pat"
-		rr := httptest.NewRecorder()
-		healthHandler(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-		if rr.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", rr.Code)
-		}
-		if !strings.Contains(rr.Body.String(), `"status":"ok"`) {
-			t.Fatalf("unexpected body: %s", rr.Body.String())
-		}
-	})
-
-	t.Run("missing config", func(t *testing.T) {
-		registryURL = ""
-		adoPAT = ""
-		rr := httptest.NewRecorder()
-		healthHandler(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-		if rr.Code != http.StatusServiceUnavailable {
-			t.Fatalf("expected 503, got %d", rr.Code)
-		}
-	})
 }
 
 func TestVerifySignature(t *testing.T) {
-	origSecret := secret
-	defer func() { secret = origSecret }()
-
+	t.Parallel()
 	body := []byte(`{"event":"pre-deploy"}`)
+	mac := hmac.New(sha256.New, []byte("s3cret"))
+	mac.Write(body)
+	good := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 
-	t.Run("empty secret allows all", func(t *testing.T) {
-		secret = ""
-		if !verifySignature(body, "") {
-			t.Fatal("empty secret should allow")
-		}
-		if !verifySignature(body, "garbage") {
-			t.Fatal("empty secret should allow any sig")
-		}
-	})
-
-	t.Run("valid signature", func(t *testing.T) {
-		secret = "test-secret"
-		sig := signBody(body, "test-secret")
-		if !verifySignature(body, sig) {
-			t.Fatal("valid sig should pass")
-		}
-	})
-
-	t.Run("invalid signature", func(t *testing.T) {
-		secret = "test-secret"
-		if verifySignature(body, "sha256=0000000000000000000000000000000000000000000000000000000000000000") {
-			t.Fatal("invalid sig should fail")
-		}
-	})
-
-	t.Run("missing signature with secret set", func(t *testing.T) {
-		secret = "test-secret"
-		if verifySignature(body, "") {
-			t.Fatal("missing sig with secret set should fail")
-		}
-	})
-}
-
-func TestSanitizeBranch(t *testing.T) {
-	cases := []struct {
-		input, expected string
+	tests := []struct {
+		name          string
+		secret        string
+		sig           string
+		allowUnsigned bool
+		want          bool
 	}{
-		{"feature/foo-bar", "feature-foo-bar"},
-		{"Feature/FOO_BAR", "feature-foobar"},
-		{"main", "main"},
-		{"v1.2.3", "v1.2.3"},
-		{"feature/special!@#chars", "feature-specialchars"},
-		{strings.Repeat("a", 200), strings.Repeat("a", 128)},
-		{"---leading", "leading"},
-		{".dotted.", "dotted"},
+		{"valid", "s3cret", good, false, true},
+		{"wrong secret", "other", good, false, false},
+		{"missing", "s3cret", "", false, false},
+		{"missing with allow unsigned", "s3cret", "", true, false},
+		{"no prefix", "s3cret", strings.TrimPrefix(good, "sha256="), false, false},
+		{"no secret fails closed", "", "", false, false},
+		{"no secret with allow unsigned", "", "", true, true},
 	}
-	for _, tc := range cases {
-		t.Run(tc.input, func(t *testing.T) {
-			got := sanitizeBranch(tc.input)
-			if got != tc.expected {
-				t.Errorf("sanitizeBranch(%q) = %q, want %q", tc.input, got, tc.expected)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := verifySignature(tt.secret, tt.allowUnsigned, body, tt.sig); got != tt.want {
+				t.Errorf("verifySignature = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestShouldSkipChart(t *testing.T) {
-	cases := []struct {
-		name   string
-		chart  ChartRef
-		branch string
-		skip   bool
-	}{
-		{"no pipeline ID", ChartRef{Name: "redis"}, "feature/x", true},
-		{"semver branch", ChartRef{Name: "app", BuildPipelineID: "42"}, "v1.2.3", true},
-		{"main branch", ChartRef{Name: "app", BuildPipelineID: "42"}, "main", true},
-		{"master branch", ChartRef{Name: "app", BuildPipelineID: "42"}, "master", true},
-		{"feature branch", ChartRef{Name: "app", BuildPipelineID: "42"}, "feature/foo", false},
-		{"prefixed semver", ChartRef{Name: "app", BuildPipelineID: "42"}, "v2.0.0-rc1", true},
+func TestLoadConfig(t *testing.T) {
+	t.Parallel()
+	// env adds a webhook secret unless the map sets one.
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string {
+			if v, ok := m[k]; ok {
+				return v
+			}
+			if k == "CI_TRIGGER_WEBHOOK_SECRET" {
+				return "s"
+			}
+			return ""
+		}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := shouldSkipChart(tc.chart, tc.branch)
-			if got != tc.skip {
-				t.Errorf("shouldSkipChart(%v, %q) = %v, want %v", tc.chart, tc.branch, got, tc.skip)
+
+	t.Run("empty secret fails closed", func(t *testing.T) {
+		t.Parallel()
+		if _, err := loadConfig(env(map[string]string{"CI_TRIGGER_WEBHOOK_SECRET": ""})); err == nil {
+			t.Error("loadConfig without secret succeeded")
+		}
+		cfg, err := loadConfig(env(map[string]string{"CI_TRIGGER_WEBHOOK_SECRET": "", "ALLOW_UNSIGNED": "true"}))
+		if err != nil || !cfg.AllowUnsigned {
+			t.Errorf("ALLOW_UNSIGNED=true: cfg.AllowUnsigned=%v err=%v", cfg.AllowUnsigned, err)
+		}
+	})
+
+	t.Run("protected tags", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := loadConfig(env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for tag, want := range map[string]bool{
+			"latest": true, "latest-dev": true, "v1.2.3": true, "1.2.3-rc1": true, "1.2.3.4": true,
+			"feature-x": false, "main": false, "latest-feature": false, "v1.2": false,
+		} {
+			if got := cfg.isProtected(tag); got != want {
+				t.Errorf("isProtected(%q) = %v, want %v", tag, got, want)
+			}
+		}
+		cfg, err = loadConfig(env(map[string]string{"PROTECTED_TAGS": "^stable$", "FALLBACK_TAG": "dev-base"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.isProtected("stable") || !cfg.isProtected("dev-base") || cfg.isProtected("latest") {
+			t.Error("custom PROTECTED_TAGS not used")
+		}
+	})
+
+	t.Run("defaults", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := loadConfig(env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AliasMarkerSuffix != ".alias" {
+			t.Errorf("AliasMarkerSuffix = %q", cfg.AliasMarkerSuffix)
+		}
+		if cfg.ShutdownTimeout != 30*time.Second || cfg.AllowUnsigned {
+			t.Errorf("ShutdownTimeout = %s, AllowUnsigned = %v", cfg.ShutdownTimeout, cfg.AllowUnsigned)
+		}
+		if cfg.ListenAddr != ":8080" || cfg.FallbackTag != "latest-dev" || cfg.PipelineSourceBranch != "refs/heads/main" ||
+			cfg.PollInterval != 15*time.Second || cfg.BuildTimeout != 25*time.Minute || cfg.CacheTTL != 5*time.Minute ||
+			!cfg.DefaultBranches["main"] || !cfg.DefaultBranches["master"] || cfg.ImageRepoPrefix != "" {
+			t.Errorf("unexpected defaults: %+v", cfg)
+		}
+		if cfg.RegistryAuth != "" || cfg.ADOAuth != "" {
+			t.Errorf("auth = %q/%q, want none", cfg.RegistryAuth, cfg.ADOAuth)
+		}
+	})
+
+	t.Run("workload identity when AZURE_CLIENT_ID is set", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := loadConfig(env(map[string]string{"AZURE_CLIENT_ID": "id", "ADO_PAT": "pat", "REGISTRY_URL": "https://x.azurecr.io/"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.RegistryAuth != authWorkloadIdentity || cfg.ADOAuth != authWorkloadIdentity {
+			t.Errorf("auth = %q/%q", cfg.RegistryAuth, cfg.ADOAuth)
+		}
+		if cfg.RegistryURL != "x.azurecr.io" {
+			t.Errorf("RegistryURL = %q", cfg.RegistryURL)
+		}
+	})
+
+	t.Run("static modes", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := loadConfig(env(map[string]string{
+			"REGISTRY_USERNAME": "u", "REGISTRY_PASSWORD": "p", "ADO_PAT": "pat",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.RegistryAuth != authBasic || cfg.ADOAuth != authPAT {
+			t.Errorf("auth = %q/%q", cfg.RegistryAuth, cfg.ADOAuth)
+		}
+	})
+
+	t.Run("explicit mode wins", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := loadConfig(env(map[string]string{"AZURE_CLIENT_ID": "id", "ADO_AUTH": "pat", "ADO_PAT": "x"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ADOAuth != authPAT || cfg.RegistryAuth != authWorkloadIdentity {
+			t.Errorf("auth = %q/%q", cfg.RegistryAuth, cfg.ADOAuth)
+		}
+	})
+
+	t.Run("lists", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := loadConfig(env(map[string]string{
+			"CHART_EXTRA_IMAGES": "pdf=gotenberg, pdf=helper ,api=worker",
+			"DEFAULT_BRANCHES":   "develop, trunk",
+			"IMAGE_REPO_PREFIX":  "dev/",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(cfg.reposFor("pdf"), ","); got != "dev/pdf,dev/gotenberg,dev/helper" {
+			t.Errorf("reposFor(pdf) = %s", got)
+		}
+		if got := strings.Join(cfg.reposFor("web"), ","); got != "dev/web" {
+			t.Errorf("reposFor(web) = %s", got)
+		}
+		if !cfg.DefaultBranches["develop"] || !cfg.DefaultBranches["trunk"] || cfg.DefaultBranches["main"] {
+			t.Errorf("DefaultBranches = %v", cfg.DefaultBranches)
+		}
+	})
+
+	for _, bad := range []map[string]string{
+		{"CHART_EXTRA_IMAGES": "pdf"},
+		{"CHART_EXTRA_IMAGES": "=x"},
+		{"REGISTRY_AUTH": "token"},
+		{"ADO_AUTH": "basic"},
+		{"PROTECTED_TAGS": "("},
+		{"FALLBACK_TAG": "bad tag"},
+		{"ALIAS_MARKER_SUFFIX": "alias"},
+		{"ALIAS_MARKER_SUFFIX": ".al/ias"},
+		{"ALIAS_MARKER_SUFFIX": "." + strings.Repeat("a", 40)},
+	} {
+		bad := bad
+		t.Run("invalid "+strings.Join(keys(bad), ","), func(t *testing.T) {
+			t.Parallel()
+			if _, err := loadConfig(env(bad)); err == nil {
+				t.Errorf("loadConfig(%v) succeeded, want error", bad)
 			}
 		})
 	}
 }
 
-func TestHandleHook_InvalidMethod(t *testing.T) {
-	origSecret := secret
-	secret = ""
-	defer func() { secret = origSecret }()
-
-	h := &handler{
-		registry: newMockRegistry(),
-		ci:       newMockCI(),
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
+func keys(m map[string]string) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
 	}
+	return out
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/hook", nil)
+func TestJWTExpiry(t *testing.T) {
+	t.Parallel()
+	// Header and signature are not checked. Payload: {"exp":2000000000}
+	tok := "eyJhbGciOiJub25lIn0.eyJleHAiOjIwMDAwMDAwMDB9.sig"
+	if got := jwtExpiry(tok); got.Unix() != 2000000000 {
+		t.Errorf("jwtExpiry = %v", got)
+	}
+	if !jwtExpiry("opaque").IsZero() {
+		t.Error("jwtExpiry(opaque) is not zero")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HTTP endpoints
+// ---------------------------------------------------------------------------
+
+func TestHealthz(t *testing.T) {
+	t.Parallel()
 	rr := httptest.NewRecorder()
-	h.hookHandler(rr, req)
-	if rr.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405, got %d", rr.Code)
-	}
-}
-
-func TestHandleHook_BadSignature(t *testing.T) {
-	origSecret := secret
-	secret = "real-secret"
-	defer func() { secret = origSecret }()
-
-	h := &handler{
-		registry: newMockRegistry(),
-		ci:       newMockCI(),
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	body, _ := json.Marshal(makeEnvelope("feature/x", nil))
-	rr := postHook(t, h.hookHandler, body, "sha256=bad")
-	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rr.Code)
-	}
-}
-
-func TestHandleHook_NoChartsWithPipeline(t *testing.T) {
-	origSecret := secret
-	secret = ""
-	defer func() { secret = origSecret }()
-
-	h := &handler{
-		registry: newMockRegistry(),
-		ci:       newMockCI(),
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	charts := []ChartRef{
-		{Name: "redis", Version: "7.0.0"},
-		{Name: "nginx", Version: "1.25.0"},
-	}
-	body, _ := json.Marshal(makeEnvelope("feature/x", charts))
-	rr := postHook(t, h.hookHandler, body, "")
-
+	healthHandler(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr.Code)
-	}
-
-	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
-	lastLine := lines[len(lines)-1]
-	var resp HookResponse
-	if err := json.Unmarshal([]byte(lastLine), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if !resp.Allowed {
-		t.Fatalf("expected allowed=true, got %+v", resp)
+		t.Errorf("status = %d", rr.Code)
 	}
 }
 
-func TestHandleHook_ImageExists(t *testing.T) {
-	origSecret := secret
-	secret = ""
-	defer func() { secret = origSecret }()
+func TestReadyz(t *testing.T) {
+	t.Parallel()
 
-	reg := newMockRegistry()
-	reg.setImage("app-api", "feature-foo", true)
-
-	h := &handler{
-		registry: reg,
-		ci:       newMockCI(),
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	charts := []ChartRef{{Name: "app-api", BuildPipelineID: "42"}}
-	body, _ := json.Marshal(makeEnvelope("feature/foo", charts))
-	rr := postHook(t, h.hookHandler, body, "")
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr.Code)
-	}
-
-	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
-	lastLine := lines[len(lines)-1]
-	var resp HookResponse
-	if err := json.Unmarshal([]byte(lastLine), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if !resp.Allowed {
-		t.Fatalf("expected allowed=true, got %+v", resp)
-	}
-
-	// Should have LOG lines about checking + finding
-	bodyStr := rr.Body.String()
-	if !strings.Contains(bodyStr, "LOG: ") {
-		t.Fatal("expected LOG lines in response")
-	}
-	if !strings.Contains(bodyStr, "found in registry") {
-		t.Fatal("expected 'found in registry' in LOG")
-	}
-}
-
-func TestHandleHook_ImageMissing_BuildSucceeds(t *testing.T) {
-	origSecret := secret
-	secret = ""
-	defer func() { secret = origSecret }()
-
-	reg := newMockRegistry()
-	ci := newMockCI()
-
-	h := &handler{
-		registry: reg,
-		ci:       ci,
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	charts := []ChartRef{{Name: "app-api", BuildPipelineID: "42"}}
-	body, _ := json.Marshal(makeEnvelope("feature/bar", charts))
-	rr := postHook(t, h.hookHandler, body, "")
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr.Code)
-	}
-
-	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
-	lastLine := lines[len(lines)-1]
-	var resp HookResponse
-	if err := json.Unmarshal([]byte(lastLine), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if !resp.Allowed {
-		t.Fatalf("expected allowed=true, got %+v", resp)
-	}
-
-	bodyStr := rr.Body.String()
-	if !strings.Contains(bodyStr, "Triggering build") {
-		t.Fatal("expected 'Triggering build' in LOG")
-	}
-	if !strings.Contains(bodyStr, "completed successfully") {
-		t.Fatal("expected 'completed successfully' in LOG")
-	}
-
-	// Verify image is now cached
-	if !h.cache.isVerified("app-api", "feature-bar") {
-		t.Fatal("expected image to be cached after successful build")
-	}
-}
-
-func TestHandleHook_BuildFails(t *testing.T) {
-	origSecret := secret
-	secret = ""
-	defer func() { secret = origSecret }()
-
-	reg := newMockRegistry()
-	ci := newMockCI()
-	// Override triggerBuild to return a build that fails
-	ci.builds["build-1"] = struct{ status, result string }{"completed", "failed"}
-
-	h := &handler{
-		registry: reg,
-		ci:       ci,
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	charts := []ChartRef{{Name: "app-api", BuildPipelineID: "42"}}
-	body, _ := json.Marshal(makeEnvelope("feature/fail", charts))
-	rr := postHook(t, h.hookHandler, body, "")
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr.Code)
-	}
-
-	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
-	lastLine := lines[len(lines)-1]
-	var resp HookResponse
-	if err := json.Unmarshal([]byte(lastLine), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp.Allowed {
-		t.Fatalf("expected allowed=false, got %+v", resp)
-	}
-	if !strings.Contains(resp.Message, "failed") {
-		t.Fatalf("expected failure message, got: %s", resp.Message)
-	}
-}
-
-func TestHandleHook_AttachesToRunningBuild(t *testing.T) {
-	origSecret := secret
-	secret = ""
-	defer func() { secret = origSecret }()
-
-	reg := newMockRegistry()
-	ci := newMockCI()
-	ci.runningBuilds["42/feature/attach"] = "existing-99"
-	ci.builds["existing-99"] = struct{ status, result string }{"completed", "succeeded"}
-
-	h := &handler{
-		registry: reg,
-		ci:       ci,
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	charts := []ChartRef{{Name: "app-api", BuildPipelineID: "42"}}
-	body, _ := json.Marshal(makeEnvelope("feature/attach", charts))
-	rr := postHook(t, h.hookHandler, body, "")
-
-	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
-	lastLine := lines[len(lines)-1]
-	var resp HookResponse
-	json.Unmarshal([]byte(lastLine), &resp)
-	if !resp.Allowed {
-		t.Fatalf("expected allowed=true, got %+v", resp)
-	}
-
-	bodyStr := rr.Body.String()
-	if !strings.Contains(bodyStr, "Found running build") {
-		t.Fatal("expected 'Found running build' in LOG")
-	}
-	if ci.triggeredCount != 0 {
-		t.Fatal("should not have triggered a new build")
-	}
-}
-
-func TestImageCache(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	c := newImageCache(5 * time.Minute)
-	c.now = func() time.Time { return now }
-
-	if c.isVerified("app", "v1") {
-		t.Fatal("empty cache should not be verified")
-	}
-
-	c.markVerified("app", "v1")
-	if !c.isVerified("app", "v1") {
-		t.Fatal("should be verified after marking")
-	}
-
-	// Advance past TTL
-	now = now.Add(6 * time.Minute)
-	if c.isVerified("app", "v1") {
-		t.Fatal("should not be verified after TTL expiry")
-	}
-}
-
-func TestACRTokenExchange(t *testing.T) {
-	tokenRequested := false
-	manifestChecks := 0
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/oauth2/token"):
-			tokenRequested = true
-			json.NewEncoder(w).Encode(map[string]string{"access_token": "test-token"})
-
-		case strings.Contains(r.URL.Path, "/v2/"):
-			manifestChecks++
-			auth := r.Header.Get("Authorization")
-			if strings.HasPrefix(auth, "Bearer ") {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusUnauthorized)
-			}
+	t.Run("ready", func(t *testing.T) {
+		t.Parallel()
+		e := newTestEnv(t, nil)
+		rr := httptest.NewRecorder()
+		e.h.routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 		}
-	}))
-	defer srv.Close()
+		if e.cred.count(acrScope) != 1 || e.cred.count(adoScope) != 1 || e.acr.exchangeCount() != 1 {
+			t.Errorf("token calls: acr=%d ado=%d exchange=%d", e.cred.count(acrScope), e.cred.count(adoScope), e.acr.exchangeCount())
+		}
+	})
 
-	host := strings.TrimPrefix(srv.URL, "http://")
-	reg := &acrRegistry{
-		url:      host,
-		username: "user",
-		password: "pass",
-		client:   srv.Client(),
-	}
-	// Override to use http instead of https for test server
-	origExists := reg.imageExists
-	_ = origExists
+	t.Run("credential fails", func(t *testing.T) {
+		t.Parallel()
+		e := newTestEnv(t, nil)
+		e.cred.err = errFake
+		rr := httptest.NewRecorder()
+		e.h.routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "registry") {
+			t.Errorf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+	})
 
-	// Use a custom registry that overrides the URL scheme for testing
-	exists, err := testACRImageExists(srv, reg, "myapp", "v1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	t.Run("no ADO auth", func(t *testing.T) {
+		t.Parallel()
+		e := newTestEnv(t, func(c *config) { c.ADOAuth = "" })
+		rr := httptest.NewRecorder()
+		e.h.routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "azure devops") {
+			t.Errorf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+func TestHook_MethodAndSignature(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, func(c *config) { c.Secret = "s3cret" })
+	mux := e.h.routes()
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/hook", nil))
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET status = %d", rr.Code)
 	}
-	if !exists {
-		t.Fatal("expected image to exist after token exchange")
+
+	body := `{"event":"pre-deploy","instance":{"id":"1","name":"x","namespace":"y"}}`
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader(body))
+	req.Header.Set("X-StackManager-Signature", "sha256=bad")
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("bad signature status = %d", rr.Code)
 	}
-	if !tokenRequested {
-		t.Fatal("expected token exchange to be requested")
+
+	mac := hmac.New(sha256.New, []byte("s3cret"))
+	mac.Write([]byte(body))
+	req = httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader(body))
+	req.Header.Set("X-StackManager-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if res := parseStream(t, rr.Body.String()); rr.Code != http.StatusOK || !res.resp.Allowed {
+		t.Errorf("good signature: status = %d, resp = %+v", rr.Code, res.resp)
 	}
 }
 
-// testACRImageExists tests the ACR flow using an httptest server.
-func testACRImageExists(srv *httptest.Server, reg *acrRegistry, repo, tag string) (bool, error) {
-	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/%s", srv.URL, repo, tag)
-	accept := "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+// ---------------------------------------------------------------------------
+// Hook flow
+// ---------------------------------------------------------------------------
 
-	exists, needToken, err := reg.headManifest(context.Background(), manifestURL, accept, reg.basicAuth())
-	if err != nil {
-		return false, err
+func TestHook_SkipsChartWithoutPipeline(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	res := e.post(t, envelope("feature/x",
+		ChartRef{Name: "redis", Branch: "feature/x"},
+		ChartRef{Name: "api", Branch: "v1.2.3", BuildPipelineID: "42", SourceRepoURL: "https://dev.azure.com/org/proj/_git/api"},
+	))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
 	}
-	if !needToken {
-		return exists, nil
+	if e.acr.putCount() != 0 || e.ado.queuedCount() != 0 || e.cred.count(acrScope) != 0 {
+		t.Errorf("gate touched registry or ADO; logs:\n%s", res.logText())
+	}
+	if !strings.Contains(res.logText(), "no build_pipeline_id") || !strings.Contains(res.logText(), "release version") {
+		t.Errorf("missing skip logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_AliasCreatedForMissingBranch(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", ociIndexType, `{"index":"fallback"}`)
+	// A longer branch with the same prefix must not count as a match.
+	e.ado.refs["org/proj/api"] = []string{"main", "feature/x-longer"}
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v\n%s", res.resp, res.logText())
+	}
+	if got, want := e.acr.digest("dev/api", "feature-x"), e.acr.digest("dev/api", "latest-dev"); got != want {
+		t.Errorf("alias digest = %s, want %s", got, want)
+	}
+	if ct := e.acr.contentType("dev/api", "feature-x"); ct != ociIndexType {
+		t.Errorf("alias content type = %q", ct)
+	}
+	if ct := e.acr.contentType("dev/api", "feature-x.alias"); ct != ociIndexType {
+		t.Errorf("marker content type = %q", ct)
+	}
+	if got := strings.Join(e.acr.putList(), ","); got != "dev/api:feature-x.alias,dev/api:feature-x" {
+		t.Errorf("PUT order = %s, want marker first", got)
+	}
+	if e.acr.digest("dev/api", "feature-x.alias") != e.acr.digest("dev/api", "feature-x") {
+		t.Error("marker digest differs from the alias")
+	}
+	if !strings.Contains(res.logText(), "does not exist") || !strings.Contains(res.logText(), "alias of latest-dev") {
+		t.Errorf("missing alias log:\n%s", res.logText())
+	}
+	if e.ado.queuedCount() != 0 {
+		t.Error("gate queued a build for a missing branch")
+	}
+}
+
+func TestHook_AliasSkippedWhenDigestEqual(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback"}`)
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	if e.acr.putCount() != 0 {
+		t.Errorf("PUT count = %d, want 0", e.acr.putCount())
+	}
+	if !strings.Contains(res.logText(), "already points to latest-dev") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_DefaultBranchKeepsCIImage(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "main", dockerV2Type, `{"m":"ci-main"}`)
+	e.ado.refs["org/proj/api"] = []string{"main"}
+
+	res := e.post(t, envelope("", appChart("api", "main")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	if e.acr.digest("dev/api", "main") != digestOf([]byte(`{"m":"ci-main"}`)) || e.acr.putCount() != 0 {
+		t.Error("gate overwrote the CI image of the default branch")
+	}
+	if !strings.Contains(res.logText(), "keeping existing dev/api:main") || e.ado.queuedCount() != 0 {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_DefaultBranchAliasCreated(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+
+	res := e.post(t, envelope("", appChart("api", "master")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	if e.acr.digest("dev/api", "master") != e.acr.digest("dev/api", "latest-dev") {
+		t.Error("master is not an alias of latest-dev")
+	}
+}
+
+func TestHook_ExistingRealTagNotOverwritten(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"real"}`)
+	// The branch is gone from the repo, but its image stays.
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	if e.acr.putCount() != 0 || e.acr.digest("dev/api", "feature-x") != digestOf([]byte(`{"m":"real"}`)) {
+		t.Error("gate overwrote a real image")
+	}
+	if !strings.Contains(res.logText(), "keeping existing dev/api:feature-x") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_ProtectedTags(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		branch    string
+		push      bool
+		wantAllow bool
+		wantText  string
+	}{
+		{"latest exists", "latest", true, true, "protected tag"},
+		{"latest missing", "latest", false, false, "protected tag"},
+		{"fallback tag from branch", "Latest-Dev", true, true, "protected tag"},
+		{"fallback tag missing", "Latest-Dev", false, false, "protected tag"},
+		{"semver case-insensitive is skipped", "V1.2.3", false, true, "release version v1.2.3"},
+		{"semver pre-release is skipped", "1.4.0-RC.1", false, true, "release version 1.4.0-rc.1"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t, nil)
+			tag := sanitizeImageTag(tt.branch)
+			if tt.push {
+				e.acr.push("dev/api", tag, dockerV2Type, `{"m":"`+tag+`"}`)
+			}
+			e.ado.refs["org/proj/api"] = []string{tt.branch}
+			chart := appChart("api", tt.branch)
+			chart.ImageTag = ""
+
+			res := e.post(t, envelope("", chart))
+			if res.resp.Allowed != tt.wantAllow {
+				t.Fatalf("resp = %+v\n%s", res.resp, res.logText())
+			}
+			if text := res.resp.Message + res.logText(); !strings.Contains(text, tt.wantText) {
+				t.Errorf("output does not contain %q:\n%s", tt.wantText, text)
+			}
+			if e.acr.putCount() != 0 || e.ado.queuedCount() != 0 {
+				t.Errorf("puts = %d, queued = %d; want 0/0", e.acr.putCount(), e.ado.queuedCount())
+			}
+		})
+	}
+}
+
+func TestHook_InvalidInputDenied(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		chart    ChartRef
+		wantText string
+	}{
+		{"bad repo", func() ChartRef { c := appChart("Bad Name", "feature/x"); return c }(), "not a valid repository"},
+		{"bad tag", func() ChartRef { c := appChart("api", "feature/x"); c.ImageTag = "-bad"; return c }(), "not a valid tag"},
+		{"dotdot branch", appChart("api", "feature/../x"), "is not allowed"},
+		{"leading dash branch", appChart("api", "-x"), "is not allowed"},
+		{"leading slash branch", appChart("api", "/x"), "is not allowed"},
+		{"shell chars in branch", appChart("api", "a;rm -rf"), "is not allowed"},
+		{"bad branch with non-ADO source", func() ChartRef {
+			c := appChart("api", "$(id)")
+			c.SourceRepoURL = ""
+			return c
+		}(), "is not allowed"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t, nil)
+			e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+			res := e.post(t, envelope("", tt.chart))
+			if res.resp.Allowed || !strings.Contains(res.resp.Message, tt.wantText) {
+				t.Errorf("resp = %+v", res.resp)
+			}
+			if e.cred.count(acrScope)+e.cred.count(adoScope) != 0 {
+				t.Error("gate called the registry or ADO before the input check")
+			}
+		})
+	}
+}
+
+func TestHook_OrgMismatchDenied(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	chart := appChart("api", "feature/x")
+	chart.SourceRepoURL = "https://dev.azure.com/OtherOrg/proj/_git/api"
+	res := e.post(t, envelope("", chart))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, `"OtherOrg" is not ADO_ORG`) {
+		t.Errorf("resp = %+v", res.resp)
+	}
+	if e.cred.count(adoScope) != 0 {
+		t.Error("gate called ADO for another organization")
 	}
 
-	// Token exchange — use test server URL instead of https
-	tokenURL := fmt.Sprintf("%s/oauth2/token?service=%s&scope=repository:%s:pull", srv.URL, reg.url, repo)
-	req, _ := http.NewRequest(http.MethodGet, tokenURL, nil)
-	req.Header.Set("Authorization", reg.basicAuth())
-	resp, err := reg.client.Do(req)
+	// The org check ignores case, and the project may differ.
+	e2 := newTestEnv(t, nil)
+	e2.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	chart.SourceRepoURL = "https://dev.azure.com/ORG/other-project/_git/api"
+	if res := e2.post(t, envelope("", chart)); !res.resp.Allowed {
+		t.Errorf("same org, other project: resp = %+v", res.resp)
+	}
+}
+
+func TestHook_TagEqualsFallbackNeverBuilds(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"latest-dev"}
+	res := e.post(t, envelope("", appChart("api", "latest-dev")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 0 || e.acr.putCount() != 0 {
+		t.Errorf("resp = %+v, queued = %d, puts = %d", res.resp, e.ado.queuedCount(), e.acr.putCount())
+	}
+}
+
+func TestHook_AliasFollowsMovedFallback(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback-v2"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback-v1"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback-v1"}`)
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	want := e.acr.digest("dev/api", "latest-dev")
+	if e.acr.digest("dev/api", "feature-x") != want || e.acr.digest("dev/api", "feature-x.alias") != want {
+		t.Error("alias and marker do not follow the moved fallback")
+	}
+	if got := strings.Join(e.acr.putList(), ","); got != "dev/api:feature-x.alias,dev/api:feature-x" {
+		t.Errorf("PUT order = %s, want marker first", got)
+	}
+	if !strings.Contains(res.logText(), "moved alias dev/api:feature-x") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_AliasThenBranchCreatedBuilds(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// An old alias. The fallback moved since then.
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback-v2"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback-v1"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback-v1"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.onQueueSuccess = func(tag string) { e.acr.push("dev/api", tag, dockerV2Type, `{"m":"built"}`) }
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 1 {
+		t.Fatalf("resp = %+v, queued = %d\n%s", res.resp, e.ado.queuedCount(), res.logText())
+	}
+	if !strings.Contains(res.logText(), "former alias") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_UnmarkedTagEqualToFallbackAllows(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// CI pushed the same image for the branch and the fallback. No marker.
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"same"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"same"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 0 {
+		t.Errorf("resp = %+v, queued = %d", res.resp, e.ado.queuedCount())
+	}
+}
+
+func TestHook_StaleMarkerMeansRealImage(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// A build replaced the alias. The old marker stays with the old digest.
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback-v2"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"built"}`)
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback-v1"}`)
+
+	// The branch is gone now: the real image is kept, not moved.
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.acr.putCount() != 0 || !strings.Contains(res.logText(), "keeping existing dev/api:feature-x") {
+		t.Errorf("resp = %+v, puts = %d\n%s", res.resp, e.acr.putCount(), res.logText())
+	}
+
+	// The branch exists: the real image is used, no build.
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.h.cache = newImageCache(0)
+	res = e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || e.ado.queuedCount() != 0 {
+		t.Errorf("resp = %+v, queued = %d", res.resp, e.ado.queuedCount())
+	}
+}
+
+func TestMarkerTag(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	if got := cfg.markerTag("feature-x"); got != "feature-x.alias" {
+		t.Errorf("markerTag = %q", got)
+	}
+	long := strings.Repeat("a", 125)
+	long2 := strings.Repeat("a", 124) + "b"
+	m1, m2 := cfg.markerTag(long), cfg.markerTag(long2)
+	if len(m1) != maxTagLength || !validTag(m1) || !strings.HasSuffix(m1, ".alias") {
+		t.Errorf("markerTag(long) = %q (len %d)", m1, len(m1))
+	}
+	if m1 == m2 {
+		t.Error("two long tags with the same prefix share one marker")
+	}
+	if cfg.markerTag(long) != m1 {
+		t.Error("markerTag is not deterministic")
+	}
+	exact := strings.Repeat("a", 122) // 122 + 6 = 128: no cut
+	if got := cfg.markerTag(exact); got != exact+".alias" {
+		t.Errorf("markerTag(exact) = %q", got)
+	}
+}
+
+func TestHook_MarkerTagIsProtected(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	chart := appChart("api", "feature/x.alias")
+	res := e.post(t, envelope("", chart))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "protected tag") || e.acr.putCount() != 0 {
+		t.Errorf("resp = %+v, puts = %d", res.resp, e.acr.putCount())
+	}
+}
+
+func TestHook_BuildDidNotPushDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback"}`) // alias
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	// The build succeeds but pushes nothing. The tag is still the alias.
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "did not push imageTag feature-x to dev/api") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+}
+
+func TestHook_PollErrorsDeny(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.failBuildGets = true
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "5 times in a row") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+	if n := e.ado.getCount(); n != maxPollErrors {
+		t.Errorf("build reads = %d, want %d", n, maxPollErrors)
+	}
+}
+
+func TestHook_FirstFailureStopsOtherCharts(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	// "web" needs a build that never ends. "api" fails at once (no fallback).
+	e.acr.push("dev/web", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/web"] = []string{"feature/x"}
+	e.ado.queuePolls = 1 << 30
+
+	start := time.Now()
+	res := e.post(t, envelope("", appChart("web", "feature/x"), appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "api:") || strings.Contains(res.resp.Message, "web:") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("response took %s; the other chart did not stop", d)
+	}
+	n := e.ado.getCount()
+	time.Sleep(50 * time.Millisecond)
+	if e.ado.getCount() != n {
+		t.Error("gate still polls after the response")
+	}
+}
+
+func TestHook_ClientDisconnectStopsPolling(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.queuePolls = 1 << 30
+
+	body, _ := json.Marshal(envelope("", appChart("api", "feature/x")))
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader(string(body))).WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		e.h.hookHandler(httptest.NewRecorder(), req)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for e.ado.getCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the client went away")
+	}
+	n := e.ado.getCount()
+	time.Sleep(50 * time.Millisecond)
+	if e.ado.getCount() != n {
+		t.Error("gate still polls after the client went away")
+	}
+}
+
+func TestHook_MissingFallbackDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "fallback dev/api:latest-dev does not exist") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+}
+
+func TestHook_ExtraImagesAliased(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, func(c *config) { c.ExtraImages = map[string][]string{"pdf": {"gotenberg"}} })
+	e.acr.push("dev/pdf", "latest-dev", dockerV2Type, `{"m":"pdf"}`)
+	e.acr.push("dev/gotenberg", "latest-dev", dockerV2Type, `{"m":"gotenberg"}`)
+
+	res := e.post(t, envelope("", appChart("pdf", "feature/y")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	for _, repo := range []string{"dev/pdf", "dev/gotenberg"} {
+		if e.acr.digest(repo, "feature-y") != e.acr.digest(repo, "latest-dev") {
+			t.Errorf("%s:feature-y is not an alias", repo)
+		}
+	}
+}
+
+func TestHook_ExistingBranchImageAllows(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"branch-build"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	if e.ado.queuedCount() != 0 || e.acr.putCount() != 0 {
+		t.Errorf("queued=%d puts=%d, want 0/0", e.ado.queuedCount(), e.acr.putCount())
+	}
+
+	// The second deploy uses the cache.
+	res = e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed || !strings.Contains(res.logText(), "(cached)") {
+		t.Errorf("second deploy: resp = %+v\n%s", res.resp, res.logText())
+	}
+}
+
+func TestHook_StaleAliasTriggersBuild(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"fallback"}`) // old alias
+	e.acr.push("dev/api", "feature-x.alias", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.onQueueSuccess = func(tag string) { e.acr.push("dev/api", tag, dockerV2Type, `{"m":"built"}`) }
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v\n%s", res.resp, res.logText())
+	}
+	if e.ado.queuedCount() != 1 {
+		t.Fatalf("queued = %d, want 1", e.ado.queuedCount())
+	}
+	q := e.ado.firstQueued()
+	if q.Definition.ID != 42 || q.SourceBranch != "refs/heads/main" ||
+		q.TemplateParameters["branch"] != "feature/x" || q.TemplateParameters["imageTag"] != "feature-x" {
+		t.Errorf("queued build = %+v", q)
+	}
+	if e.acr.digest("dev/api", "feature-x") != digestOf([]byte(`{"m":"built"}`)) {
+		t.Error("tag does not hold the built image")
+	}
+	for _, want := range []string{"is a former alias of latest-dev", "Queued build #101", "https://ado.example/build/101", "succeeded"} {
+		if !strings.Contains(res.logText(), want) {
+			t.Errorf("logs do not contain %q:\n%s", want, res.logText())
+		}
+	}
+}
+
+func TestHook_MissingImageTagUsesSanitizer(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"Feature/Mixed_Case"}
+	e.ado.onQueueSuccess = func(tag string) { e.acr.push("dev/api", tag, dockerV2Type, `{"m":"built"}`) }
+
+	chart := appChart("api", "Feature/Mixed_Case")
+	chart.ImageTag = ""
+	res := e.post(t, envelope("", chart))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v\n%s", res.resp, res.logText())
+	}
+	if got := e.ado.firstQueued().TemplateParameters["imageTag"]; got != "feature-mixed-case" {
+		t.Errorf("imageTag = %q", got)
+	}
+}
+
+func TestHook_ReusesRunningBuild(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.omitListTP = true // force a read of each build
+	e.ado.addRunning(7, 42, "other-tag", nil)
+	e.ado.addRunning(8, 42, "feature-x", func() { e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"built"}`) })
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if !res.resp.Allowed {
+		t.Fatalf("resp = %+v\n%s", res.resp, res.logText())
+	}
+	if e.ado.queuedCount() != 0 {
+		t.Errorf("queued = %d, want 0", e.ado.queuedCount())
+	}
+	if !strings.Contains(res.logText(), "Reusing running build #8") {
+		t.Errorf("logs:\n%s", res.logText())
+	}
+}
+
+func TestHook_BuildFailureDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.acr.push("dev/web", "latest-dev", dockerV2Type, `{"m":"fallback-web"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	e.ado.nextResult = "failed"
+
+	// "web" has no branch and is aliased. "api" fails. The deploy is denied.
+	res := e.post(t, envelope("", appChart("api", "feature/x"), appChart("web", "feature/x")))
+	if res.resp.Allowed {
+		t.Fatalf("resp = %+v", res.resp)
+	}
+	for _, want := range []string{"api:", `result "failed"`, "https://ado.example/build/101"} {
+		if !strings.Contains(res.resp.Message, want) {
+			t.Errorf("message %q does not contain %q", res.resp.Message, want)
+		}
+	}
+	if strings.Contains(res.resp.Message, "web:") {
+		t.Errorf("message names the passing chart: %q", res.resp.Message)
+	}
+}
+
+func TestHook_BuildTimeoutDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, func(c *config) { c.BuildTimeout = 30 * time.Millisecond; c.PollInterval = time.Hour })
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "did not finish within") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+}
+
+func TestHook_BuildSucceedsButImageMissingDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, func(c *config) { c.ExtraImages = map[string][]string{"api": {"api-worker"}} })
+	e.acr.push("dev/api", "latest-dev", dockerV2Type, `{"m":"fallback"}`)
+	e.ado.refs["org/proj/api"] = []string{"feature/x"}
+	// The pipeline pushes only the main image, not the extra one.
+	e.ado.onQueueSuccess = func(tag string) { e.acr.push("dev/api", tag, dockerV2Type, `{"m":"built"}`) }
+
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "did not push imageTag feature-x to dev/api-worker") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+}
+
+func TestHook_NonADOSourceAssumesBranchExists(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "feature-x", dockerV2Type, `{"m":"built"}`)
+	chart := appChart("api", "feature/x")
+	chart.SourceRepoURL = "https://gitlab.com/group/api.git"
+
+	res := e.post(t, envelope("", chart))
+	if !res.resp.Allowed || !strings.Contains(res.logText(), "assuming branch") {
+		t.Errorf("resp = %+v\n%s", res.resp, res.logText())
+	}
+}
+
+func TestHook_RefsErrorDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.cred.err = errFake // no ADO token
+	res := e.post(t, envelope("", appChart("api", "feature/x")))
+	if res.resp.Allowed || !strings.Contains(res.resp.Message, "check branch") {
+		t.Errorf("resp = %+v", res.resp)
+	}
+}
+
+func TestHook_MissingInstanceDenies(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	res := e.post(t, EventEnvelope{Event: "pre-deploy"})
+	if res.resp.Allowed {
+		t.Errorf("resp = %+v", res.resp)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Registry auth
+// ---------------------------------------------------------------------------
+
+func TestACR_WorkloadIdentityTokensCached(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "t", dockerV2Type, `{}`)
+	reg := e.h.registry.(*acrClient)
+	for i := 0; i < 3; i++ {
+		if d, err := reg.headDigest(t.Context(), "dev/api", "t"); err != nil || d == "" {
+			t.Fatalf("headDigest = %q, %v", d, err)
+		}
+	}
+	if e.acr.exchangeCount() != 1 || e.cred.count(acrScope) != 1 {
+		t.Errorf("exchanges = %d, entra calls = %d; want 1/1", e.acr.exchangeCount(), e.cred.count(acrScope))
+	}
+}
+
+func TestACR_StaleTokenRetried(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, nil)
+	e.acr.push("dev/api", "t", dockerV2Type, `{}`)
+	reg := e.h.registry.(*acrClient)
+	reg.tokens.put("repo:dev/api", "stale", time.Now().Add(time.Hour))
+	if d, err := reg.headDigest(t.Context(), "dev/api", "t"); err != nil || d == "" {
+		t.Fatalf("headDigest = %q, %v", d, err)
+	}
+	if v, _ := reg.tokens.get("repo:dev/api"); v != "acc|repository:dev/api:pull,push" {
+		t.Errorf("cached token = %q, want the new token", v)
+	}
+}
+
+func TestManifestPathEscapes(t *testing.T) {
+	t.Parallel()
+	if got := manifestPath("dev/a b", "x?y"); got != "/v2/dev/a%20b/manifests/x%3Fy" {
+		t.Errorf("manifestPath = %q", got)
+	}
+}
+
+func TestServeGracefulShutdown(t *testing.T) {
+	t.Parallel()
+	stopped := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // a hook that waits for a build
+		close(stopped)
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return false, err
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, srv, ln, 50*time.Millisecond) }()
+
+	resp, err := http.Get("http://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	var tok struct {
-		AccessToken string `json:"access_token"`
+	cancel() // SIGTERM
+
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request was not stopped after the shutdown timeout")
 	}
-	json.NewDecoder(resp.Body).Decode(&tok)
-
-	exists, _, err = reg.headManifest(context.Background(), manifestURL, accept, "Bearer "+tok.AccessToken)
-	return exists, err
-}
-
-func TestHandleHook_MultipleCharts(t *testing.T) {
-	origSecret := secret
-	secret = ""
-	defer func() { secret = origSecret }()
-
-	reg := newMockRegistry()
-	reg.setImage("app-api", "feature-multi", true)
-	// app-worker not in registry → will trigger build
-	ci := newMockCI()
-
-	h := &handler{
-		registry: reg,
-		ci:       ci,
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	charts := []ChartRef{
-		{Name: "redis"},                                            // no pipeline, skipped
-		{Name: "app-api", BuildPipelineID: "42"},                   // exists in registry
-		{Name: "app-worker", BuildPipelineID: "43"},                // will trigger build
-	}
-	body, _ := json.Marshal(makeEnvelope("feature/multi", charts))
-	rr := postHook(t, h.hookHandler, body, "")
-
-	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
-	lastLine := lines[len(lines)-1]
-	var resp HookResponse
-	json.Unmarshal([]byte(lastLine), &resp)
-	if !resp.Allowed {
-		t.Fatalf("expected allowed=true, got %+v", resp)
-	}
-
-	if ci.triggeredCount != 1 {
-		t.Fatalf("expected 1 build triggered, got %d", ci.triggeredCount)
-	}
-
-	bodyStr := rr.Body.String()
-	if !strings.Contains(bodyStr, "found in registry") {
-		t.Fatal("expected app-api found in registry")
-	}
-	if !strings.Contains(bodyStr, "Triggering build") {
-		t.Fatal("expected app-worker build triggered")
-	}
-}
-
-func TestHandleHook_ImageRepoPrefix(t *testing.T) {
-	origSecret := secret
-	origPrefix := imageRepoPrefix
-	secret = ""
-	imageRepoPrefix = "dev"
-	defer func() { secret = origSecret; imageRepoPrefix = origPrefix }()
-
-	reg := newMockRegistry()
-	reg.setImage("dev/app-api", "feature-pfx", true)
-	ci := newMockCI()
-
-	h := &handler{
-		registry: reg,
-		ci:       ci,
-		cache:    newImageCache(5 * time.Minute),
-		poll:     50 * time.Millisecond,
-	}
-
-	charts := []ChartRef{{Name: "app-api", BuildPipelineID: "42"}}
-	body, _ := json.Marshal(makeEnvelope("feature/pfx", charts))
-	rr := postHook(t, h.hookHandler, body, "")
-
-	lines := strings.Split(strings.TrimSpace(rr.Body.String()), "\n")
-	lastLine := lines[len(lines)-1]
-	var resp HookResponse
-	json.Unmarshal([]byte(lastLine), &resp)
-	if !resp.Allowed {
-		t.Fatalf("expected allowed=true, got %+v", resp)
-	}
-
-	bodyStr := rr.Body.String()
-	if !strings.Contains(bodyStr, "dev/app-api") {
-		t.Fatal("expected LOG to reference dev/app-api (prefixed repo)")
-	}
-	if !strings.Contains(bodyStr, "found in registry") {
-		t.Fatal("expected image found in registry with prefixed path")
-	}
-}
-
-func newTestADOProvider(t *testing.T, handler http.Handler) *adoProvider {
-	t.Helper()
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
-	return &adoProvider{
-		pat:             "test-pat",
-		client:          srv.Client(),
-		baseURLOverride: srv.URL,
-	}
-}
-
-func TestADOProvider_FindRunningBuild(t *testing.T) {
-	p := newTestADOProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("expected GET, got %s", r.Method)
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serve = %v", err)
 		}
-		if r.Header.Get("Authorization") == "" {
-			t.Error("missing auth header")
-		}
-		if !strings.Contains(r.URL.RawQuery, "definitions=42") {
-			t.Errorf("expected definitions=42 in query, got %s", r.URL.RawQuery)
-		}
-		if !strings.Contains(r.URL.RawQuery, "branchName=refs") {
-			t.Errorf("expected branchName in query, got %s", r.URL.RawQuery)
-		}
-		json.NewEncoder(w).Encode(map[string]any{
-			"value": []map[string]any{{"id": 123}},
-		})
-	}))
-
-	id, err := p.findRunningBuild(context.Background(), "42", "feature/x")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if id != "123" {
-		t.Fatalf("expected build ID 123, got %s", id)
+	case <-time.After(7 * time.Second):
+		t.Fatal("serve did not return")
 	}
 }
 
-func TestADOProvider_FindRunningBuild_NoneRunning(t *testing.T) {
-	p := newTestADOProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"value": []any{}})
-	}))
-
-	id, err := p.findRunningBuild(context.Background(), "42", "main")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestACR_BasicAuth(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, func(c *config) { c.RegistryAuth = authBasic })
+	e.acr.push("dev/api", "t", dockerV2Type, `{}`)
+	reg := e.h.registry.(*acrClient)
+	if d, err := reg.headDigest(t.Context(), "dev/api", "t"); err != nil || d == "" {
+		t.Fatalf("headDigest = %q, %v", d, err)
 	}
-	if id != "" {
-		t.Fatalf("expected empty ID, got %s", id)
+	if err := reg.ping(t.Context()); err != nil {
+		t.Errorf("ping: %v", err)
 	}
-}
-
-func TestADOProvider_TriggerBuild(t *testing.T) {
-	var receivedBody map[string]any
-
-	p := newTestADOProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("expected POST, got %s", r.Method)
-		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("expected application/json content type, got %s", r.Header.Get("Content-Type"))
-		}
-		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &receivedBody)
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]any{"id": 456})
-	}))
-
-	id, err := p.triggerBuild(context.Background(), "42", "feature/bar", "feature-bar")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if e.cred.count(acrScope) != 0 {
+		t.Error("basic mode used the Entra credential")
 	}
-	if id != "456" {
-		t.Fatalf("expected build ID 456, got %s", id)
-	}
-
-	def, ok := receivedBody["definition"].(map[string]any)
-	if !ok {
-		t.Fatal("missing definition in request body")
-	}
-	if defID, _ := def["id"].(float64); defID != 42 {
-		t.Fatalf("expected definition.id=42, got %v", defID)
-	}
-	if sb, _ := receivedBody["sourceBranch"].(string); sb != "refs/heads/main" {
-		t.Fatalf("expected sourceBranch=refs/heads/main, got %s", sb)
-	}
-	tp, _ := receivedBody["templateParameters"].(map[string]any)
-	if tp == nil {
-		t.Fatal("missing templateParameters in request body")
-	}
-	if tp["branch"] != "feature/bar" {
-		t.Fatalf("expected templateParameters.branch=feature/bar, got %v", tp["branch"])
-	}
-	if tp["imageTag"] != "feature-bar" {
-		t.Fatalf("expected templateParameters.imageTag=feature-bar, got %v", tp["imageTag"])
+	reg.password = "wrong"
+	reg.tokens.drop("repo:dev/api")
+	if _, err := reg.headDigest(t.Context(), "dev/api", "t"); err == nil || strings.Contains(err.Error(), "wrong") {
+		t.Errorf("headDigest with wrong password: %v", err)
 	}
 }
 
-func TestADOProvider_TriggerBuild_InvalidPipelineID(t *testing.T) {
-	p := newTestADOProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("should not have made a request")
-	}))
-
-	_, err := p.triggerBuild(context.Background(), "not-a-number", "main", "main")
-	if err == nil {
-		t.Fatal("expected error for non-numeric pipeline ID")
+func TestADO_PATAuthHeader(t *testing.T) {
+	t.Parallel()
+	a := newADOClient("o", "p", authPAT, "secret-pat", "refs/heads/main", nil)
+	h, err := a.authHeader(t.Context())
+	if err != nil || h != basicAuth("", "secret-pat") {
+		t.Errorf("authHeader = %q, %v", h, err)
 	}
 }
-
-func TestADOProvider_GetBuildStatus(t *testing.T) {
-	p := newTestADOProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/789") {
-			t.Errorf("expected path to end with /789, got %s", r.URL.Path)
-		}
-		json.NewEncoder(w).Encode(map[string]any{
-			"status": "completed",
-			"result": "succeeded",
-		})
-	}))
-
-	status, result, err := p.getBuildStatus(context.Background(), "789")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if status != "completed" || result != "succeeded" {
-		t.Fatalf("expected completed/succeeded, got %s/%s", status, result)
-	}
-}
-
