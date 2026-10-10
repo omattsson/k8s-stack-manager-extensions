@@ -133,7 +133,7 @@ class TestBuildTemplateVariables(unittest.TestCase):
              patch.object(server, "STACK_MANAGER_URL", "https://sm.example"):
             variables = server.build_template_variables(SAMPLE_ENVELOPE)
         expected_keys = {
-            "name", "namespace", "branch", "cluster_id", "status",
+            "name", "namespace", "branch", "cluster_id", "cluster_name", "status",
             "instance_id", "emoji", "outcome", "color",
             "instance_url", "site_url", "site_domain", "stack_manager_url",
         }
@@ -909,6 +909,64 @@ class TestHTTPHandlerEvents(unittest.TestCase):
             self.assertEqual(self._post(_event_envelope("stop-completed")), 200)
         mock_enqueue.assert_not_called()
         mock_print.assert_any_call("INFO ignored event=stop-completed (not in TEAMS_EVENTS)", flush=True)
+
+
+class TestClusterName(unittest.TestCase):
+    """Cards show the cluster name when the envelope has `cluster_name`, else the ID."""
+
+    NAMED = {**SAMPLE_ENVELOPE["instance"], "cluster_id": "d23adba9-1111", "cluster_name": "kvk-k8s-dev"}
+
+    def test_cluster_label(self):
+        cases = [
+            ({"cluster_id": "id-1", "cluster_name": "dev"}, "dev"),
+            ({"cluster_id": "id-1", "cluster_name": ""}, "id-1"),
+            ({"cluster_id": "id-1"}, "id-1"),
+            ({}, ""),
+        ]
+        for obj, want in cases:
+            with self.subTest(obj=obj):
+                self.assertEqual(server.cluster_label(obj), want)
+
+    def test_deploy_card_shows_name(self):
+        env = {**SAMPLE_ENVELOPE, "instance": self.NAMED}
+        with patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(env)
+        facts = {f["title"]: f["value"] for f in card["attachments"][0]["content"]["body"][1]["facts"]}
+        self.assertEqual(facts["Cluster"], "kvk-k8s-dev")
+
+    def test_deploy_card_falls_back_to_id(self):
+        with patch.object(server, "_card_template", None):
+            card = server.build_adaptive_card(SAMPLE_ENVELOPE)
+        facts = {f["title"]: f["value"] for f in card["attachments"][0]["content"]["body"][1]["facts"]}
+        self.assertEqual(facts["Cluster"], "dev")
+
+    def test_template_variables(self):
+        v = server.build_template_variables({**SAMPLE_ENVELOPE, "instance": self.NAMED})
+        self.assertEqual(v["cluster_name"], "kvk-k8s-dev")
+        self.assertEqual(v["cluster_id"], "d23adba9-1111")
+        self.assertEqual(server.build_template_variables(SAMPLE_ENVELOPE)["cluster_name"], "dev")
+
+    def test_event_card_shows_name(self):
+        env = _event_envelope("stop-completed")
+        env["instance"] = {**self.NAMED, "status": "stopped"}
+        _, facts, _ = _card_texts(server.build_hook_card(env))
+        self.assertEqual(facts["Cluster"], "kvk-k8s-dev")
+
+    def test_name_is_escaped(self):
+        env = _event_envelope("stop-completed")
+        env["instance"] = {**self.NAMED, "status": "stopped", "cluster_name": "*bold*"}
+        _, facts, _ = _card_texts(server.build_hook_card(env))
+        self.assertEqual(facts["Cluster"], server.md("*bold*"))
+        self.assertNotEqual(facts["Cluster"], "*bold*")
+
+    def test_policy_card_shows_name_or_id(self):
+        run = json.loads(json.dumps(SAMPLE_POLICY_RUN))
+        _, facts, _ = _card_texts(server.build_hook_card(run))
+        self.assertEqual(facts["Cluster"], "all")
+        run["cleanup_policy"]["cluster_id"] = "d23adba9-1111"
+        run["cleanup_policy"]["cluster_name"] = "kvk-k8s-dev"
+        _, facts, _ = _card_texts(server.build_hook_card(run))
+        self.assertEqual(facts["Cluster"], "kvk-k8s-dev")
 
 
 if __name__ == "__main__":

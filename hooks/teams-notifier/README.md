@@ -26,7 +26,7 @@ The hook also accepts notification channel payloads (`event_type`), see the noti
 | `rollback-completed` | "↩ Rollback succeeded", "❌ Rollback failed", "⛔ Rollback rejected" or "⚠️ Rollback cancelled" — `<name>` (from `metadata.outcome`) |
 | `cleanup-policy-executed` | "🧹 Cleanup policy `<policy>`: `<action>` on `<n>` stack(s)" (plus "(dry run)"). The body lists the stacks (at most 20) with their result and error. |
 
-The stop, clean, delete, rollback and timeout cards show the namespace, branch and cluster, and a "Triggered by" fact from the envelope `trigger`:
+The stop, clean, delete, rollback and timeout cards show the namespace, branch and cluster, and a "Triggered by" fact from the envelope `trigger`. The "Cluster" fact on all cards shows the cluster name when the envelope has `cluster_name` (next to `cluster_id`). Without it (an older k8s-stack-manager), the fact shows the cluster ID:
 
 | `trigger.type` | Shown as |
 |---|---|
@@ -91,7 +91,7 @@ Subscribe to the events that you want in Teams (see [hooks-config.json](hooks-co
 
 ### Privacy
 
-The cards go to a Teams channel. They contain stack names, namespaces, branches, cluster IDs, error texts and, from `trigger`, the username of the user who started an operation. Everyone with access to the channel can read them. Post only to a channel with the right audience, or remove events from `TEAMS_EVENTS`.
+The cards go to a Teams channel. They contain stack names, namespaces, branches, cluster names or IDs, error texts and, from `trigger`, the username of the user who started an operation. Everyone with access to the channel can read them. Post only to a channel with the right audience, or remove events from `TEAMS_EVENTS`.
 
 ### Setting up the Teams webhook
 
@@ -112,6 +112,7 @@ The workflow accepts the same Adaptive Card message format that this hook sends.
 | Variable | Value |
 |---|---|
 | `name`, `namespace`, `branch`, `cluster_id`, `status`, `instance_id` | From the envelope `instance` |
+| `cluster_name` | The envelope `instance.cluster_name`, else `cluster_id` |
 | `emoji`, `outcome`, `color` | `✅` / `succeeded` / `good` for a running stack, else `❌` / `failed` / `attention` |
 | `instance_url` | `<STACK_MANAGER_URL>/stack-instances/<instance_id>` |
 | `site_url`, `site_domain` | `https://<name>.<SITE_DOMAIN>` and `SITE_DOMAIN` |
