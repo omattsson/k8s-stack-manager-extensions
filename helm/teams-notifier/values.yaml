@@ -6,7 +6,8 @@ image:
 replicas: 1
 port: 8080
 
-# Required: Microsoft Teams Incoming Webhook URL
+# Required: Teams Workflows webhook URL ("Post to a channel when a webhook
+# request is received"). The Microsoft 365 Incoming Webhook connectors are retired.
 teamsWebhookUrl: ""
 
 # HMAC shared secret for verifying requests from k8s-stack-manager.
@@ -17,11 +18,30 @@ webhookSecret: ""
 # URL of the k8s-stack-manager UI — used in the "View instance" button
 stackManagerUrl: "https://stack-manager.example"
 
-# Custom Adaptive Card template (JSON). When set, replaces the default card.
+# Custom Adaptive Card template (JSON). When set, replaces the default card
+# of deploy-finalized (other events use the built-in cards).
 # Supports {{name}}, {{namespace}}, {{branch}}, {{status}}, {{instance_id}},
 # {{instance_url}}, {{outcome}}, {{emoji}}, {{cluster_id}} variables.
 # Example: see README.md
 cardTemplate: ""
+
+# Hook events that post a Teams card. Used for the hook subscription
+# (hooksConfig) and for TEAMS_EVENTS. Remove an event to stop its cards. Must
+# not be empty (the render fails). deploy-timeout is also supported; it is not
+# in the default list because the "Deploy failed" card of deploy-finalized
+# covers a timeout.
+events:
+  - deploy-finalized
+  - stop-completed
+  - clean-completed
+  - delete-completed
+  - rollback-completed
+  - cleanup-policy-executed
+
+# Post the stop/clean/delete cards of a cleanup policy run too. Default
+# false: the cleanup-policy-executed summary card lists these stacks. Failed
+# operations always post a card.
+policyInstanceCards: false
 
 # Worker pool tuning
 workers: 4

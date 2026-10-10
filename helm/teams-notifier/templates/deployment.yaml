@@ -37,6 +37,10 @@ spec:
               value: {{ .Values.workers | quote }}
             - name: TEAMS_QUEUE_SIZE
               value: {{ .Values.queueSize | quote }}
+            - name: TEAMS_EVENTS
+              value: {{ required "events must list at least one hook event" (join "," .Values.events) | quote }}
+            - name: TEAMS_POLICY_INSTANCE_CARDS
+              value: {{ .Values.policyInstanceCards | quote }}
             {{- if .Values.cardTemplate }}
             - name: CARD_TEMPLATE_FILE
               value: /config/card-template.json

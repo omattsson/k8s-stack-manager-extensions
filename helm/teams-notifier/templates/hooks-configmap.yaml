@@ -1,4 +1,7 @@
 {{- if .Values.hooksConfig.enabled }}
+{{- if not .Values.events }}
+{{- fail "events must list at least one hook event" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,7 +17,7 @@ data:
       "subscriptions": [
         {
           "name": "teams-notifier",
-          "events": ["deploy-finalized"],
+          "events": {{ .Values.events | toJson }},
           "url": "{{ include "teams-notifier.serviceUrl" . }}/hook",
           "timeout_seconds": {{ .Values.hooksConfig.timeoutSeconds }},
           "failure_policy": {{ .Values.hooksConfig.failurePolicy | quote }},
