@@ -2,7 +2,14 @@
   "subscriptions": [
     {
       "name": "teams-notifier",
-      "events": ["deploy-finalized"],
+      "events": [
+        "deploy-finalized",
+        "stop-completed",
+        "clean-completed",
+        "delete-completed",
+        "rollback-completed",
+        "cleanup-policy-executed"
+      ],
       "url": "http://teams-notifier.extensions.svc.cluster.local:8080/hook",
       "timeout_seconds": 10,
       "failure_policy": "ignore",

@@ -9,7 +9,7 @@ These extensions use the [webhook extension system](https://github.com/omattsson
 | Extension | Type | Language | Description |
 |---|---|---|---|
 | [slack-notifier](hooks/slack-notifier/) | Event hook | Python | Post to Slack on deploy success/failure |
-| [teams-notifier](hooks/teams-notifier/) | Event hook | Python | Post to Microsoft Teams on deploy success/failure |
+| [teams-notifier](hooks/teams-notifier/) | Event hook | Python | Post to Microsoft Teams on deploy, stop, clean, delete, rollback, deploy timeout and cleanup policy runs |
 | [webhook-relay](hooks/webhook-relay/) | Event hook | Python | Forward events to arbitrary HTTP endpoints with retry |
 | [maintenance-gate](hooks/maintenance-gate/) | Event hook | Python | Block deploys outside configurable business hours |
 | [security-scan-gate](hooks/security-scan-gate/) | Event hook | Go | Block deploys when images have critical CVEs (Trivy) |
