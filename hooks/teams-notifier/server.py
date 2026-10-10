@@ -141,6 +141,13 @@ def render_template(template: str, variables: dict[str, str]) -> dict:
     return json.loads(rendered)
 
 
+def cluster_label(obj: dict) -> str:
+    """Return the cluster name when the envelope has one (`cluster_name`, next
+    to `cluster_id`), else the cluster ID. Older k8s-stack-manager versions
+    send only the ID."""
+    return obj.get("cluster_name") or obj.get("cluster_id") or ""
+
+
 def build_template_variables(envelope: dict) -> dict[str, str]:
     instance = envelope.get("instance", {})
     name = instance.get("name", "unknown")
@@ -154,6 +161,7 @@ def build_template_variables(envelope: dict) -> dict[str, str]:
         "namespace": instance.get("namespace", "unknown"),
         "branch": instance.get("branch", "unknown"),
         "cluster_id": instance.get("cluster_id", ""),
+        "cluster_name": cluster_label(instance),
         "status": status,
         "instance_id": instance_id,
         "emoji": "✅" if is_success else "❌",
@@ -185,7 +193,7 @@ def build_adaptive_card(envelope: dict) -> dict:
     name = instance.get("name", "unknown")
     namespace = md(instance.get("namespace", "unknown"))
     branch = md(instance.get("branch", "unknown"))
-    cluster_id = md(instance.get("cluster_id", ""))
+    cluster = md(cluster_label(instance))
     status = instance.get("status", "")
     instance_id = instance.get("id", "")
 
@@ -201,8 +209,8 @@ def build_adaptive_card(envelope: dict) -> dict:
         {"title": "Namespace", "value": namespace},
         {"title": "Branch", "value": branch},
     ]
-    if cluster_id:
-        facts.append({"title": "Cluster", "value": cluster_id})
+    if cluster:
+        facts.append({"title": "Cluster", "value": cluster})
 
     card = {
         "type": "message",
@@ -270,8 +278,8 @@ def _instance_facts(instance: dict, trigger: str) -> list[dict]:
         {"title": "Namespace", "value": md(instance.get("namespace", "unknown"))},
         {"title": "Branch", "value": md(instance.get("branch", "unknown"))},
     ]
-    if instance.get("cluster_id"):
-        facts.append({"title": "Cluster", "value": md(instance["cluster_id"])})
+    if cluster_label(instance):
+        facts.append({"title": "Cluster", "value": md(cluster_label(instance))})
     if trigger:
         facts.append({"title": "Triggered by", "value": md(trigger)})
     return facts
@@ -381,7 +389,7 @@ def build_policy_card(envelope: dict) -> dict:
         lines.append(f"- and {hidden} more")
 
     facts = [
-        {"title": "Cluster", "value": md(run.get("cluster_id", ""))},
+        {"title": "Cluster", "value": md(cluster_label(run))},
         {"title": "Run", "value": md(run.get("run", ""))},
         {"title": "Succeeded", "value": str(run.get("succeeded", 0))},
         {"title": "Failed", "value": str(failed)},
