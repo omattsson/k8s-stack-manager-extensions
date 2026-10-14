@@ -55,6 +55,8 @@ func (f *fakeCred) count(scope string) int {
 // ---------------------------------------------------------------------------
 
 const (
+	// testHead is the commit of every fake branch unless fakeADO.heads sets one.
+	testHead         = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	testRegistryHost = "test.azurecr.io"
 	ociIndexType     = "application/vnd.oci.image.index.v1+json"
 	dockerV2Type     = "application/vnd.docker.distribution.manifest.v2+json"
@@ -72,16 +74,25 @@ func digestOf(body []byte) string {
 
 type fakeACR struct {
 	manifests map[string]map[string]storedManifest // repo → tag → manifest
+	blobs     map[string]map[string][]byte         // repo → digest → blob
 	srv       *httptest.Server
-	puts      []string
-	exchanges int
-	username  string
-	password  string
-	mu        sync.Mutex
+	// blobRedirect, when set, is the base URL that blob reads redirect to.
+	blobRedirect string
+	blobGets     int
+	puts         []string
+	exchanges    int
+	username     string
+	password     string
+	mu           sync.Mutex
 }
 
 func newFakeACR(t *testing.T) *fakeACR {
-	f := &fakeACR{manifests: map[string]map[string]storedManifest{}, username: "user", password: "pass"}
+	f := &fakeACR{
+		manifests: map[string]map[string]storedManifest{},
+		blobs:     map[string]map[string][]byte{},
+		username:  "user",
+		password:  "pass",
+	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -94,6 +105,44 @@ func (f *fakeACR) push(repo, tag, contentType, body string) {
 		f.manifests[repo] = map[string]storedManifest{}
 	}
 	f.manifests[repo][tag] = storedManifest{contentType: contentType, body: []byte(body)}
+}
+
+// pushImage stores a single-platform image under repo:tag whose config has
+// the revision label rev ("" means no label). It returns the manifest body.
+func (f *fakeACR) pushImage(repo, tag, rev string) string {
+	labels := map[string]string{"maintainer": "test"}
+	if rev != "" {
+		labels[revisionLabel] = rev
+	}
+	cfg, _ := json.Marshal(map[string]any{"architecture": "amd64", "os": "linux", "config": map[string]any{"Labels": labels}})
+	cfgDigest := digestOf(cfg)
+	body := fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"digest":%q},"layers":[],"tag":%q}`, dockerV2Type, cfgDigest, tag)
+	f.mu.Lock()
+	if f.blobs[repo] == nil {
+		f.blobs[repo] = map[string][]byte{}
+	}
+	f.blobs[repo][cfgDigest] = cfg
+	f.mu.Unlock()
+	f.push(repo, tag, dockerV2Type, body)
+	return body
+}
+
+// pushIndex stores an image index under repo:tag with an attestation
+// manifest first and a linux/amd64 image whose revision label is rev.
+func (f *fakeACR) pushIndex(repo, tag, rev string) {
+	platform := f.pushImage(repo, "platform-"+tag, rev)
+	attestation := f.pushImage(repo, "attestation-"+tag, "attestation-commit")
+	index := fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[`+
+		`{"digest":%q,"platform":{"os":"unknown","architecture":"unknown"}},`+
+		`{"digest":%q,"platform":{"os":"linux","architecture":"amd64"}}]}`,
+		ociIndexType, digestOf([]byte(attestation)), digestOf([]byte(platform)))
+	f.push(repo, tag, ociIndexType, index)
+}
+
+func (f *fakeACR) blobGetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.blobGets
 }
 
 func (f *fakeACR) digest(repo, tag string) string {
@@ -167,6 +216,10 @@ func (f *fakeACR) serve(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeACR) serveManifest(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v2/")
+	if j := strings.LastIndex(rest, "/blobs/"); j >= 0 {
+		f.serveBlob(w, r, rest[:j], rest[j+len("/blobs/"):])
+		return
+	}
 	i := strings.LastIndex(rest, "/manifests/")
 	if i < 0 {
 		http.NotFound(w, r)
@@ -183,6 +236,15 @@ func (f *fakeACR) serveManifest(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodHead, http.MethodGet:
 		m, ok := f.manifests[repo][ref]
+		if !ok && strings.HasPrefix(ref, "sha256:") {
+			// A registry also serves a manifest by its digest.
+			for _, cand := range f.manifests[repo] {
+				if digestOf(cand.body) == ref {
+					m, ok = cand, true
+					break
+				}
+			}
+		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -205,6 +267,26 @@ func (f *fakeACR) serveManifest(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (f *fakeACR) serveBlob(w http.ResponseWriter, r *http.Request, repo, digest string) {
+	if r.Header.Get("Authorization") != "Bearer acc|repository:"+repo+":pull,push" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.blobGets++
+	if f.blobRedirect != "" {
+		http.Redirect(w, r, f.blobRedirect+"/storage/"+repo+"/"+digest, http.StatusTemporaryRedirect)
+		return
+	}
+	b, ok := f.blobs[repo][digest]
+	if !ok || r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Write(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +313,7 @@ type queuedBuild struct {
 
 type fakeADO struct {
 	refs   map[string][]string // "org/project/repo" → branch names
+	heads  map[string]string   // "org/project/repo/branch" → commit (default testHead)
 	builds map[int]*fakeBuild
 	srv    *httptest.Server
 	// nextResult is the result of the next queued build.
@@ -252,6 +335,7 @@ type fakeADO struct {
 func newFakeADO(t *testing.T) *fakeADO {
 	f := &fakeADO{
 		refs:       map[string][]string{},
+		heads:      map[string]string{},
 		builds:     map[int]*fakeBuild{},
 		nextID:     100,
 		nextResult: "succeeded",
@@ -321,7 +405,11 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 		var value []map[string]string
 		for _, b := range f.refs[key] {
 			if name := "refs/heads/" + b; strings.HasPrefix(name, prefix) {
-				value = append(value, map[string]string{"name": name})
+				head, ok := f.heads[key+"/"+b]
+				if !ok {
+					head = testHead
+				}
+				value = append(value, map[string]string{"name": name, "objectId": head})
 			}
 		}
 		json.NewEncoder(w).Encode(map[string]any{"value": value})
@@ -424,6 +512,7 @@ func testConfig() config {
 		PollInterval:         5 * time.Millisecond,
 		BuildTimeout:         5 * time.Second,
 		CacheTTL:             time.Minute,
+		RebuildOnNewCommit:   true,
 	}
 }
 

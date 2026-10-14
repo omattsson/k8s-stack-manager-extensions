@@ -106,6 +106,7 @@ type config struct {
 	CacheTTL             time.Duration
 	ShutdownTimeout      time.Duration
 	AllowUnsigned        bool
+	RebuildOnNewCommit   bool
 }
 
 // loadConfig reads the configuration from getenv.
@@ -139,6 +140,12 @@ func loadConfig(getenv func(string) string) (config, error) {
 		AllowUnsigned:        strings.EqualFold(get("ALLOW_UNSIGNED", ""), "true"),
 		DefaultBranches:      map[string]bool{},
 	}
+
+	rebuild, err := strconv.ParseBool(get("REBUILD_ON_NEW_COMMIT", "true"))
+	if err != nil {
+		return config{}, fmt.Errorf("REBUILD_ON_NEW_COMMIT %q must be true or false", get("REBUILD_ON_NEW_COMMIT", ""))
+	}
+	cfg.RebuildOnNewCommit = rebuild
 
 	if cfg.Secret == "" && !cfg.AllowUnsigned {
 		return config{}, errors.New("CI_TRIGGER_WEBHOOK_SECRET is not set; set ALLOW_UNSIGNED=true to accept unsigned requests")
@@ -270,35 +277,42 @@ func verifySignature(secret string, allowUnsigned bool, body []byte, signature s
 // Image cache
 // ---------------------------------------------------------------------------
 
-// imageCache remembers branch images that the gate found. It never holds
-// alias tags.
+// imageCache remembers branch images that the gate found, with the branch
+// head that the gate checked. It never holds alias tags.
 type imageCache struct {
-	entries map[string]time.Time
+	entries map[string]imageCacheEntry
 	now     func() time.Time
 	ttl     time.Duration
 	mu      sync.RWMutex
 }
 
+type imageCacheEntry struct {
+	at   time.Time
+	head string // branch head when the gate checked the image ("" when unknown)
+}
+
 func newImageCache(ttl time.Duration) *imageCache {
 	return &imageCache{
-		entries: make(map[string]time.Time),
+		entries: make(map[string]imageCacheEntry),
 		ttl:     ttl,
 		now:     time.Now,
 	}
 }
 
-func (c *imageCache) isVerified(repo, tag string) bool {
+// isVerified reports whether the gate checked repo:tag against the same
+// branch head within the cache TTL.
+func (c *imageCache) isVerified(repo, tag, head string) bool {
 	key := repo + ":" + tag
 	c.mu.RLock()
-	t, ok := c.entries[key]
+	e, ok := c.entries[key]
 	c.mu.RUnlock()
-	return ok && c.now().Before(t.Add(c.ttl))
+	return ok && e.head == head && c.now().Before(e.at.Add(c.ttl))
 }
 
-func (c *imageCache) markVerified(repo, tag string) {
+func (c *imageCache) markVerified(repo, tag, head string) {
 	key := repo + ":" + tag
 	c.mu.Lock()
-	c.entries[key] = c.now()
+	c.entries[key] = imageCacheEntry{at: c.now(), head: head}
 	c.mu.Unlock()
 }
 
@@ -356,7 +370,12 @@ type handler struct {
 	ci         ciProvider
 	cache      *imageCache
 	queueLocks *keyedMutex
-	cfg        config
+	// builtFor maps repo@digest to the branch head of the build that the
+	// gate waited for. Such an image is never old for that head, also when
+	// its revision label is wrong, so a wrong label costs one build, not one
+	// build per deploy.
+	builtFor *boundedCache
+	cfg      config
 }
 
 func newHandler(cfg config, reg registryClient, ci ciProvider) *handler {
@@ -366,6 +385,7 @@ func newHandler(cfg config, reg registryClient, ci ciProvider) *handler {
 		ci:         ci,
 		cache:      newImageCache(cfg.CacheTTL),
 		queueLocks: newKeyedMutex(),
+		builtFor:   newBoundedCache(),
 	}
 }
 
@@ -393,6 +413,9 @@ func (h *handler) processChart(ctx context.Context, chart ChartRef, branch, tag 
 		return h.aliasRepos(ctx, repos, tag, fmt.Sprintf("branch %q is a default branch", branch), log)
 	}
 
+	// head is the branch commit that the images must be built from. It is
+	// "" when the gate cannot read it or REBUILD_ON_NEW_COMMIT is false.
+	head := ""
 	src, ok := parseADORepoURL(chart.SourceRepoURL)
 	if !ok {
 		// The gate cannot check the branch. Build, as before.
@@ -401,15 +424,18 @@ func (h *handler) processChart(ctx context.Context, chart ChartRef, branch, tag 
 		if h.cfg.ADOOrg != "" && !strings.EqualFold(src.Org, h.cfg.ADOOrg) {
 			return fmt.Errorf("source repo organization %q is not ADO_ORG %q; the gate checks branches only in ADO_ORG", src.Org, h.cfg.ADOOrg)
 		}
-		exists, err := h.ci.branchExists(ctx, src, branch)
+		commit, exists, err := h.ci.branchHead(ctx, src, branch)
 		if err != nil {
 			return fmt.Errorf("check branch %q in %s/%s: %w", branch, src.Project, src.Repo, err)
 		}
 		if !exists {
 			return h.aliasRepos(ctx, repos, tag, fmt.Sprintf("branch %q does not exist in %s", branch, src.Repo), log)
 		}
+		if h.cfg.RebuildOnNewCommit {
+			head = commit
+		}
 	}
-	return h.ensureBuilt(ctx, chart, repos, branch, tag, log)
+	return h.ensureBuilt(ctx, chart, repos, branch, tag, head, log)
 }
 
 // checkProtected allows a protected tag only when it exists in each repo.
@@ -503,8 +529,9 @@ func (h *handler) aliasRepos(ctx context.Context, repos []string, tag, reason st
 }
 
 // ensureBuilt makes sure a branch image exists in each repo. It queues or
-// reuses a build when an image is missing or is an alias that the gate made.
-func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []string, branch, tag string, log logFunc) error {
+// reuses a build when an image is missing, is an alias that the gate made,
+// or was built from another commit than head (when head is not "").
+func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []string, branch, tag, head string, log logFunc) error {
 	pipelineID, err := strconv.Atoi(chart.BuildPipelineID)
 	if err != nil {
 		return fmt.Errorf("build_pipeline_id %q is not a number", chart.BuildPipelineID)
@@ -512,7 +539,7 @@ func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []strin
 
 	needBuild := false
 	for _, repo := range repos {
-		if h.cache.isVerified(repo, tag) {
+		if h.cache.isVerified(repo, tag, head) {
 			log("Image %s:%s found (cached)", repo, tag)
 			continue
 		}
@@ -534,47 +561,161 @@ func (h *handler) ensureBuilt(ctx context.Context, chart ChartRef, repos []strin
 			needBuild = true
 			continue
 		}
+		if h.imageIsOld(ctx, repo, tag, cur, head, log) {
+			needBuild = true
+			continue
+		}
 		log("Image %s:%s found (%s)", repo, tag, shortDigest(cur))
-		h.cache.markVerified(repo, tag)
+		h.cache.markVerified(repo, tag, head)
 	}
 	if !needBuild {
 		return nil
 	}
 
-	build, err := h.findOrQueueBuild(ctx, pipelineID, branch, tag, log)
+	build, reused, err := h.findOrQueueBuild(ctx, pipelineID, branch, tag, 0, log)
 	if err != nil {
 		return err
 	}
 	if err := h.waitForBuild(ctx, build, chart.Name, log); err != nil {
 		return err
 	}
-
-	// The build must have pushed a new image for every repo of the chart.
-	// The old marker can stay: it no longer matches the tag, so it is harmless.
-	for _, repo := range repos {
-		cur, err := h.registry.headDigest(ctx, repo, tag)
+	old, err := h.checkBuiltImages(ctx, build, repos, tag, head, reused, log)
+	if err != nil {
+		return err
+	}
+	if old {
+		// The reused build started before the newest commit. Build once more.
+		// A build queued after the old one (by another deploy) is newer, so
+		// it is shared.
+		build, _, err = h.findOrQueueBuild(ctx, pipelineID, branch, tag, build.ID+1, log)
 		if err != nil {
 			return err
 		}
-		alias, err := h.isGateAlias(ctx, repo, tag, cur)
-		if err != nil {
+		if err := h.waitForBuild(ctx, build, chart.Name, log); err != nil {
 			return err
 		}
-		if cur == "" || alias {
-			return fmt.Errorf("build #%d succeeded but the pipeline did not push imageTag %s to %s: %s", build.ID, tag, repo, h.link(build))
+		// Do not build a third time: a newer commit gets the next deploy.
+		if _, err := h.checkBuiltImages(ctx, build, repos, tag, head, false, log); err != nil {
+			return err
 		}
-		h.cache.markVerified(repo, tag)
 	}
 	log("Images for %s are ready", chart.Name)
 	return nil
+}
+
+// checkBuiltImages checks the images after a successful build. Every repo of
+// the chart must have a new image under tag (not an alias that the gate
+// made); else it returns an error. For a reused build (reused is true) whose
+// image has a revision label that is not head, it returns true and records
+// nothing, so the caller builds again. Otherwise it logs a warning for a
+// label that is not head, records the images as built for head and caches
+// them.
+func (h *handler) checkBuiltImages(ctx context.Context, build *buildInfo, repos []string, tag, head string, reused bool, log logFunc) (bool, error) {
+	digests := make([]string, len(repos))
+	revs := make([]string, len(repos))
+	for i, repo := range repos {
+		cur, err := h.registry.headDigest(ctx, repo, tag)
+		if err != nil {
+			return false, err
+		}
+		alias, err := h.isGateAlias(ctx, repo, tag, cur)
+		if err != nil {
+			return false, err
+		}
+		// The old marker can stay: it no longer matches the tag, so it is harmless.
+		if cur == "" || alias {
+			return false, fmt.Errorf("build #%d succeeded but the pipeline did not push imageTag %s to %s: %s", build.ID, tag, repo, h.link(build))
+		}
+		digests[i] = cur
+		if head == "" {
+			continue
+		}
+		rev, err := h.registry.imageRevision(ctx, repo, cur)
+		if err != nil {
+			log("WARNING: cannot read label %s of %s:%s (%v)", revisionLabel, repo, tag, err)
+			continue
+		}
+		revs[i] = rev
+		if built, ok := h.builtFor.get(repo + "@" + cur); ok && built == head {
+			// Another deploy waited for this build at head. Its label can be wrong.
+			continue
+		}
+		if reused && rev != "" && !sameCommit(rev, head) {
+			log("Reused build #%d pushed %s:%s from commit %s, but the branch is at %s; building again",
+				build.ID, repo, tag, shortCommit(rev), shortCommit(head))
+			return true, nil
+		}
+	}
+	for i, repo := range repos {
+		if head != "" {
+			if revs[i] != "" && !sameCommit(revs[i], head) {
+				log("WARNING: the build pushed %s:%s from commit %s, but the branch was at %s. "+
+					"The branch moved during the build, or the pipeline sets %s to another commit (see the README)",
+					repo, tag, shortCommit(revs[i]), shortCommit(head), revisionLabel)
+			}
+			h.builtFor.put(repo+"@"+digests[i], head)
+		}
+		h.cache.markVerified(repo, tag, head)
+	}
+	return false, nil
+}
+
+// imageIsOld reports whether the image repo:tag (digest) was built from
+// another commit than head, so the gate must build it again. It returns
+// false when head is "", and when the image has no revision label or the
+// label cannot be read: the gate never blocks a deploy for that reason.
+func (h *handler) imageIsOld(ctx context.Context, repo, tag, digest, head string, log logFunc) bool {
+	if head == "" {
+		return false
+	}
+	if built, ok := h.builtFor.get(repo + "@" + digest); ok && built == head {
+		// The gate built this image for head. Its label can be wrong.
+		return false
+	}
+	rev, err := h.registry.imageRevision(ctx, repo, digest)
+	if err != nil {
+		log("WARNING: cannot read label %s of %s:%s (%v); keeping the image", revisionLabel, repo, tag, err)
+		return false
+	}
+	if rev == "" {
+		log("WARNING: %s:%s has no label %s; cannot compare it with branch commit %s, keeping the image", repo, tag, revisionLabel, shortCommit(head))
+		return false
+	}
+	if sameCommit(rev, head) {
+		return false
+	}
+	log("Image %s:%s is at %s, branch is at %s; building again", repo, tag, shortCommit(rev), shortCommit(head))
+	return true
+}
+
+// sameCommit reports whether two commit IDs name the same commit. One ID can
+// be a short form (at least 7 characters) of the other.
+func sameCommit(a, b string) bool {
+	a, b = strings.ToLower(strings.TrimSpace(a)), strings.ToLower(strings.TrimSpace(b))
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	if len(a) < 7 {
+		return a != "" && a == b
+	}
+	return strings.HasPrefix(b, a)
+}
+
+// shortCommit returns the first 8 characters of a commit ID, for logs.
+func shortCommit(c string) string {
+	if len(c) > 8 {
+		return c[:8]
+	}
+	return c
 }
 
 func (h *handler) link(b *buildInfo) string {
 	return buildLink(h.cfg.ADOOrg, h.cfg.ADOProject, b)
 }
 
-// findOrQueueBuild reuses a running build for the same tag, or queues one.
-func (h *handler) findOrQueueBuild(ctx context.Context, pipelineID int, branch, tag string, log logFunc) (*buildInfo, error) {
+// findOrQueueBuild reuses a running build for the same tag whose ID is at
+// least minID, or queues one. It reports whether it reused a build.
+func (h *handler) findOrQueueBuild(ctx context.Context, pipelineID int, branch, tag string, minID int, log logFunc) (*buildInfo, bool, error) {
 	unlock := h.queueLocks.lock(strconv.Itoa(pipelineID) + "|" + tag)
 	defer unlock()
 
@@ -582,17 +723,17 @@ func (h *handler) findOrQueueBuild(ctx context.Context, pipelineID int, branch, 
 	if err != nil {
 		log("WARNING: cannot list running builds of pipeline %d: %v", pipelineID, err)
 	}
-	if b != nil {
+	if b != nil && b.ID >= minID {
 		log("Reusing running build #%d (pipeline %d, tag %s): %s", b.ID, pipelineID, tag, h.link(b))
-		return b, nil
+		return b, true, nil
 	}
 
 	b, err = h.ci.queueBuild(ctx, pipelineID, branch, tag)
 	if err != nil {
-		return nil, fmt.Errorf("queue build of pipeline %d for branch %q: %w", pipelineID, branch, err)
+		return nil, false, fmt.Errorf("queue build of pipeline %d for branch %q: %w", pipelineID, branch, err)
 	}
 	log("Queued build #%d (pipeline %d, branch %s, tag %s): %s", b.ID, pipelineID, branch, tag, h.link(b))
-	return b, nil
+	return b, false, nil
 }
 
 // maxPollErrors is the number of failed status reads in a row after which
