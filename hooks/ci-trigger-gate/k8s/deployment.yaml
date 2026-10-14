@@ -42,6 +42,8 @@ data:
   POLL_INTERVAL_SECONDS: "15"
   BUILD_TIMEOUT_MINUTES: "25"
   CACHE_TTL_MINUTES: "5"
+  # Build a branch image again when its revision label is not the branch head.
+  REBUILD_ON_NEW_COMMIT: "true"
   SHUTDOWN_TIMEOUT_SECONDS: "30"
   # Client ID of the managed identity or app registration with the
   # federated credential for system:serviceaccount:extensions:ci-trigger-gate.

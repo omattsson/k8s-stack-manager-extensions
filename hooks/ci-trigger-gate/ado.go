@@ -117,8 +117,9 @@ func (b *buildInfo) webURL() string {
 
 // ciProvider talks to Azure DevOps. Abstracted for testing.
 type ciProvider interface {
-	// branchExists reports whether refs/heads/{branch} exists in repo.
-	branchExists(ctx context.Context, repo adoRepo, branch string) (bool, error)
+	// branchHead returns the commit of refs/heads/{branch} in repo, and
+	// whether the branch exists.
+	branchHead(ctx context.Context, repo adoRepo, branch string) (string, bool, error)
 	// findRunningBuild returns an unfinished build of the pipeline whose
 	// imageTag template parameter equals imageTag, or nil.
 	findRunningBuild(ctx context.Context, pipelineID int, imageTag string) (*buildInfo, error)
@@ -229,7 +230,7 @@ func (a *adoClient) doJSON(ctx context.Context, method, u string, in, out any) e
 	return nil
 }
 
-func (a *adoClient) branchExists(ctx context.Context, repo adoRepo, branch string) (bool, error) {
+func (a *adoClient) branchHead(ctx context.Context, repo adoRepo, branch string) (string, bool, error) {
 	q := url.Values{
 		"filter":      {"heads/" + branch},
 		"api-version": {"7.1"},
@@ -239,20 +240,21 @@ func (a *adoClient) branchExists(ctx context.Context, repo adoRepo, branch strin
 
 	var result struct {
 		Value []struct {
-			Name string `json:"name"`
+			Name     string `json:"name"`
+			ObjectID string `json:"objectId"`
 		} `json:"value"`
 	}
 	if err := a.doJSON(ctx, http.MethodGet, u, nil, &result); err != nil {
-		return false, err
+		return "", false, err
 	}
 	// The filter is a prefix match. Only an exact name counts.
 	want := "refs/heads/" + branch
 	for _, ref := range result.Value {
 		if ref.Name == want {
-			return true, nil
+			return ref.ObjectID, true, nil
 		}
 	}
-	return false, nil
+	return "", false, nil
 }
 
 func (a *adoClient) findRunningBuild(ctx context.Context, pipelineID int, imageTag string) (*buildInfo, error) {

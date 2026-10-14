@@ -2,7 +2,7 @@
 
 A `pre-deploy` webhook for k8s-stack-manager. It makes sure that each chart has a container image for the deployed branch before the deploy starts.
 
-- If the branch exists in the chart's source repo, the gate builds the image with an Azure DevOps pipeline when needed. The deploy waits for the build.
+- If the branch exists in the chart's source repo, the gate builds the image with an Azure DevOps pipeline when the image is missing or the branch has newer commits. The deploy waits for the build.
 - If the branch does not exist, or is a default branch, the gate makes the branch tag an alias of a fallback tag (default `latest-dev`).
 
 The registry is Azure Container Registry (ACR). The CI system is Azure DevOps (ADO). By default the gate uses workload identity, so it needs no registry or ADO secret.
@@ -20,7 +20,7 @@ For each chart:
    - the tag or a repo name is not valid for a container registry.
 4. **Repos.** The chart's image repos are `IMAGE_REPO_PREFIX` + chart name, plus the extra repos from `CHART_EXTRA_IMAGES`.
 5. **Protected tags.** If the tag is `FALLBACK_TAG`, ends with `ALIAS_MARKER_SUFFIX`, or matches `PROTECTED_TAGS` (default: `latest` and release versions), the gate never aliases or builds it. It allows the deploy if the tag exists in each repo, and denies it if not.
-6. **Branch check.** The gate parses `source_repo_url` and asks the ADO Git refs API if `refs/heads/<branch>` exists. Only an exact name match counts. Branches in `DEFAULT_BRANCHES` count as default, also when they exist. When `ADO_ORG` is set, the organization in `source_repo_url` must be `ADO_ORG` (case-insensitive), else the deploy is denied. The project can differ.
+6. **Branch check.** The gate parses `source_repo_url` and asks the ADO Git refs API if `refs/heads/<branch>` exists, and reads its commit (the branch head). Only an exact name match counts. Branches in `DEFAULT_BRANCHES` count as default, also when they exist. When `ADO_ORG` is set, the organization in `source_repo_url` must be `ADO_ORG` (case-insensitive), else the deploy is denied. The project can differ.
 7. **Branch does not exist, or is a default branch:** for each repo:
    - `<repo>:<tag>` does not exist: the gate creates an alias (see [Alias markers](#alias-markers)).
    - `<repo>:<tag>` is an alias that the gate made: the gate moves it to the current fallback image if the fallback moved. Otherwise nothing changes.
@@ -28,6 +28,17 @@ For each chart:
 8. **Branch exists:** for each repo, a real image under `<repo>:<tag>` is ready, also when it has the same digest as the fallback (CI can build the same commit for both). If the tag is missing or is an alias that the gate made, the gate:
    - reuses a running build of the same pipeline whose `imageTag` template parameter is the tag, or
    - queues a new build with template parameters `branch` and `imageTag`, on the pipeline repo ref `PIPELINE_SOURCE_BRANCH`.
+
+   **New commits** (`REBUILD_ON_NEW_COMMIT`, default `true`). For a real image, the gate reads the label `org.opencontainers.image.revision` (for an image index, of the linux/amd64 image) and compares it with the branch head:
+   - The label is the branch head (or a short form of it, at least 7 characters): the gate keeps the image.
+   - The label is another commit: the gate logs `Image <repo>:<tag> is at <commit>, branch is at <commit>; building again` and builds, as for a missing tag. When one repo of the chart is older than the branch head, the gate builds the chart.
+   - The image has no label, or the gate cannot read it: the gate keeps the image and logs a warning. The gate never denies a deploy for this reason.
+   - The gate cannot read the branch head (the source repo is not in Azure DevOps): the gate keeps the image.
+
+   After a build:
+   - A reused build can be of an older commit. When its image has a label that is not the branch head, the gate builds once more and waits. It reuses a build that started after the old build (for example from another deploy), or queues a new one.
+   - When the label of a new image is not the branch head, the gate logs a warning and allows the deploy. The branch moved during the build, or the pipeline sets the label to another commit (see [Pipeline contract](#pipeline-contract)).
+   - The gate remembers each image that it built for a branch head, until the gate restarts. It does not build that image again for the same head, also when the label is wrong. A wrong label costs one build for each new commit, not one build for each deploy.
 
    The gate polls the build and streams progress. It denies the deploy when the build fails, is canceled, does not finish within `BUILD_TIMEOUT_MINUTES`, or when 5 status reads in a row fail. The message includes the build URL. After a successful build, every repo of the chart must have the tag, and the tag must not be an alias that the gate made. Otherwise the gate denies the deploy, because the pipeline did not push `imageTag`.
 
@@ -39,7 +50,7 @@ Notes:
 
 - If `source_repo_url` is not an Azure DevOps Git URL, the gate cannot check the branch. It assumes that the branch exists. The branch check in step 3 still applies.
 - If the fallback tag does not exist in a repo, and the branch tag does not exist either, the deploy is denied.
-- Images found for a branch build are cached for `CACHE_TTL_MINUTES`. Aliases are never cached.
+- Images found for a branch build are cached for `CACHE_TTL_MINUTES`, together with the branch head that the gate checked. A new commit on the branch bypasses the cache. Aliases are never cached.
 - Two deploys of the same branch at the same time share one build.
 
 ### Alias markers
@@ -68,7 +79,19 @@ git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
 Each chart's `build_pipeline_id` is the ID of an ADO pipeline in `ADO_ORG`/`ADO_PROJECT`. The pipeline must:
 
 - accept the template parameters `branch` (the app branch to build) and `imageTag` (the tag to push);
-- push `<registry>/<repo>:<imageTag>` for every repo of the chart.
+- push `<registry>/<repo>:<imageTag>` for every repo of the chart;
+- set the label `org.opencontainers.image.revision` to the commit of the app branch that it builds. Without the label, the gate cannot see new commits and keeps the image (see step 8). Always set the label: an image gets the labels of its base image, and many base images set this label to their own commit.
+
+`Build.SourceVersion` is the commit of the repo that holds the pipeline YAML. When the pipeline checks out the app repo as a second repo, read the app commit after the checkout and pass it to the build, for example:
+
+```yaml
+- checkout: self
+- checkout: app   # the repository resource of the app
+  path: app       # $(Pipeline.Workspace)/app
+- script: |
+    APP_COMMIT=$(git -C "$(Pipeline.Workspace)/app" rev-parse HEAD)
+    docker buildx build --label "org.opencontainers.image.revision=$APP_COMMIT" ...
+```
 
 Warning: treat `branch` and `imageTag` as untrusted input. The gate checks them, but the pipeline must not trust them. Do not put `${{ parameters.branch }}` or `${{ parameters.imageTag }}` into a script body. Pass them to scripts as environment variables, for example:
 
@@ -142,6 +165,7 @@ When `REGISTRY_AUTH` or `ADO_AUTH` is not set, the gate uses workload identity i
 | `POLL_INTERVAL_SECONDS` | `15` | Seconds between build status polls |
 | `BUILD_TIMEOUT_MINUTES` | `25` | Maximum wait for one build |
 | `CACHE_TTL_MINUTES` | `5` | Minutes to cache found branch images |
+| `REBUILD_ON_NEW_COMMIT` | `true` | `true` builds a branch image again when its label `org.opencontainers.image.revision` is not the branch head. `false` keeps every real image. With another value, the gate does not start. |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `30` | On SIGTERM, time that in-flight hooks get to finish |
 
 Note: `IMAGE_REPO_PREFIX` is now added as is. Earlier versions added a `/`. Change `dev` to `dev/`.
