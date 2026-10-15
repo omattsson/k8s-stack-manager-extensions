@@ -2,7 +2,7 @@
   "subscriptions": [
     {
       "name": "maintenance-gate",
-      "events": ["pre-deploy"],
+      "events": ["pre-deploy", "pre-rollback"],
       "url": "http://maintenance-gate.extensions.svc.cluster.local:8080/hook",
       "timeout_seconds": 3,
       "failure_policy": "fail",
