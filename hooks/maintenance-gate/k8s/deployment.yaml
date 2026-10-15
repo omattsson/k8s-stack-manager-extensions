@@ -12,6 +12,40 @@ type: Opaque
 stringData:
   GATE_WEBHOOK_SECRET: "REPLACE_ME"
 ---
+# The gate reads the maintenance switch (ConfigMap maintenance-gate-state)
+# through the Kubernetes API. The Role allows only "get" on that one ConfigMap.
+# scripts/maintenance.sh writes it with the rights of the operator.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maintenance-gate
+  namespace: extensions
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maintenance-gate
+  namespace: extensions
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["maintenance-gate-state"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maintenance-gate
+  namespace: extensions
+subjects:
+  - kind: ServiceAccount
+    name: maintenance-gate
+    namespace: extensions
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: maintenance-gate
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,6 +63,7 @@ spec:
       labels:
         app: maintenance-gate
     spec:
+      serviceAccountName: maintenance-gate
       containers:
         - name: maintenance-gate
           image: maintenance-gate:latest
@@ -40,6 +75,12 @@ spec:
           env:
             - name: TIMEZONE
               value: "Europe/Stockholm"
+            # Maintenance switch (scripts/maintenance.sh). Remove to turn it off.
+            - name: STATE_CONFIGMAP
+              value: "maintenance-gate-state"
+            # "false": only the maintenance switch closes the gate.
+            - name: SCHEDULE_ENABLED
+              value: "true"
             - name: ALLOWED_DAYS
               value: "mon,tue,wed,thu,fri"
             - name: ALLOWED_START_HOUR
@@ -52,12 +93,14 @@ spec:
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 10
+            timeoutSeconds: 3
           readinessProbe:
             httpGet:
               path: /healthz
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 5
+            timeoutSeconds: 3
           resources:
             requests:
               cpu: 10m
