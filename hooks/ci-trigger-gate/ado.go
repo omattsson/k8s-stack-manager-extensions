@@ -260,7 +260,7 @@ func (a *adoClient) branchHead(ctx context.Context, repo adoRepo, branch string)
 func (a *adoClient) findRunningBuild(ctx context.Context, pipelineID int, imageTag string) (*buildInfo, error) {
 	q := url.Values{
 		"definitions":  {strconv.Itoa(pipelineID)},
-		"statusFilter": {"inProgress,notStarted"},
+		"statusFilter": {"inProgress,notStarted,postponed"},
 		"api-version":  {"7.1"},
 	}
 	var result struct {

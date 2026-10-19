@@ -103,6 +103,7 @@ type config struct {
 	AliasMarkerSuffix    string
 	PollInterval         time.Duration
 	BuildTimeout         time.Duration
+	QueueTimeout         time.Duration
 	CacheTTL             time.Duration
 	ShutdownTimeout      time.Duration
 	AllowUnsigned        bool
@@ -135,6 +136,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		AliasMarkerSuffix:    get("ALIAS_MARKER_SUFFIX", ".alias"),
 		PollInterval:         time.Duration(envInt(get, "POLL_INTERVAL_SECONDS", 15, 1)) * time.Second,
 		BuildTimeout:         time.Duration(envInt(get, "BUILD_TIMEOUT_MINUTES", 25, 1)) * time.Minute,
+		QueueTimeout:         time.Duration(envInt(get, "QUEUE_TIMEOUT_MINUTES", 0, 0)) * time.Minute,
 		CacheTTL:             time.Duration(envInt(get, "CACHE_TTL_MINUTES", 5, 0)) * time.Minute,
 		ShutdownTimeout:      time.Duration(envInt(get, "SHUTDOWN_TIMEOUT_SECONDS", 30, 0)) * time.Second,
 		AllowUnsigned:        strings.EqualFold(get("ALLOW_UNSIGNED", ""), "true"),
@@ -724,7 +726,7 @@ func (h *handler) findOrQueueBuild(ctx context.Context, pipelineID int, branch, 
 		log("WARNING: cannot list running builds of pipeline %d: %v", pipelineID, err)
 	}
 	if b != nil && b.ID >= minID {
-		log("Reusing running build #%d (pipeline %d, tag %s): %s", b.ID, pipelineID, tag, h.link(b))
+		log("Reusing build #%d (%s, pipeline %d, tag %s): %s", b.ID, b.Status, pipelineID, tag, h.link(b))
 		return b, true, nil
 	}
 
@@ -741,22 +743,35 @@ func (h *handler) findOrQueueBuild(ctx context.Context, pipelineID int, branch, 
 const maxPollErrors = 5
 
 // waitForBuild polls a build until it completes, fails or times out.
+//
+// With QueueTimeout 0, BuildTimeout counts from the start of the wait, also
+// while the build waits for a free agent. With QueueTimeout > 0, the time in
+// the queue has its own limit, and BuildTimeout counts from the first poll
+// that shows the build running. A build that times out in the queue is not
+// canceled: it runs later, and the next deploy reuses it or its image.
 func (h *handler) waitForBuild(ctx context.Context, b *buildInfo, chart string, log logFunc) error {
-	ctx, cancel := context.WithTimeout(ctx, h.cfg.BuildTimeout)
-	defer cancel()
-
 	start := time.Now()
+	limit := h.cfg.BuildTimeout
+	if h.cfg.QueueTimeout > 0 {
+		limit = h.cfg.QueueTimeout
+	}
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
 	ticker := time.NewTicker(h.cfg.PollInterval)
 	defer ticker.Stop()
 	pollErrors := 0
+	lastStatus := ""
+	running, wasQueued := false, false
+	queueLogMinute := -1
 
 	for {
 		select {
 		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("build #%d for %s did not finish within %s: %s", b.ID, chart, h.cfg.BuildTimeout, h.link(b))
-			}
 			return fmt.Errorf("stopped waiting for build #%d for %s: %w", b.ID, chart, ctx.Err())
+		case <-deadline.C:
+			// The queue limit fired, or (one limit) the last poll showed the queue.
+			inQueue := !running && (h.cfg.QueueTimeout > 0 || isQueued(lastStatus))
+			return h.waitTimeoutError(b, chart, inQueue)
 		case <-ticker.C:
 		}
 
@@ -773,7 +788,28 @@ func (h *handler) waitForBuild(ctx context.Context, b *buildInfo, chart string, 
 			continue
 		}
 		pollErrors = 0
+		lastStatus = cur.Status
 		elapsed := time.Since(start).Truncate(time.Second)
+		if isQueued(cur.Status) {
+			wasQueued = true
+			// One line per minute: the core keeps only the last 16 KiB of progress lines.
+			if minute := int(elapsed / time.Minute); minute != queueLogMinute {
+				queueLogMinute = minute
+				log("Build #%d for %s: queued, waiting for a free build agent (%s)", b.ID, chart, elapsed)
+			}
+			continue
+		}
+		if !running {
+			running = true
+			if h.cfg.QueueTimeout > 0 {
+				// The queue limit no longer applies. The build gets BuildTimeout from now.
+				// Since Go 1.23, Reset needs no drain of the channel.
+				deadline.Reset(h.cfg.BuildTimeout)
+			}
+			if wasQueued {
+				log("Build #%d for %s: an agent took the build (%s)", b.ID, chart, elapsed)
+			}
+		}
 		if cur.Status != "completed" {
 			log("Build #%d for %s: %s (%s)", b.ID, chart, cur.Status, elapsed)
 			continue
@@ -786,6 +822,26 @@ func (h *handler) waitForBuild(ctx context.Context, b *buildInfo, chart string, 
 			return fmt.Errorf("build #%d for %s finished with result %q: %s", b.ID, chart, cur.Result, h.link(b))
 		}
 	}
+}
+
+// isQueued reports whether an Azure DevOps build status means that the build
+// waits for an agent.
+func isQueued(status string) bool {
+	return status == "notStarted" || status == "postponed"
+}
+
+// waitTimeoutError returns the error for a build that did not finish in time.
+// inQueue is true when the build had not started.
+func (h *handler) waitTimeoutError(b *buildInfo, chart string, inQueue bool) error {
+	if !inQueue {
+		return fmt.Errorf("build #%d for %s did not finish within %s: %s", b.ID, chart, h.cfg.BuildTimeout, h.link(b))
+	}
+	limit := h.cfg.BuildTimeout
+	if h.cfg.QueueTimeout > 0 {
+		limit = h.cfg.QueueTimeout
+	}
+	return fmt.Errorf("build #%d for %s did not start within %s: it waits for a free build agent. "+
+		"The build stays queued and runs later. Deploy again when it has finished: %s", b.ID, chart, limit, h.link(b))
 }
 
 // ---------------------------------------------------------------------------
@@ -994,6 +1050,7 @@ func main() {
 		"pipeline_source_branch", cfg.PipelineSourceBranch,
 		"poll_interval", cfg.PollInterval,
 		"build_timeout", cfg.BuildTimeout,
+		"queue_timeout", cfg.QueueTimeout,
 		"cache_ttl", cfg.CacheTTL,
 		"shutdown_timeout", cfg.ShutdownTimeout,
 	)

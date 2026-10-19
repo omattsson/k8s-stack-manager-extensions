@@ -40,7 +40,7 @@ For each chart:
    - When the label of a new image is not the branch head, the gate logs a warning and allows the deploy. The branch moved during the build, or the pipeline sets the label to another commit (see [Pipeline contract](#pipeline-contract)).
    - The gate remembers each image that it built for a branch head, until the gate restarts. It does not build that image again for the same head, also when the label is wrong. A wrong label costs one build for each new commit, not one build for each deploy.
 
-   The gate polls the build and streams progress. It denies the deploy when the build fails, is canceled, does not finish within `BUILD_TIMEOUT_MINUTES`, or when 5 status reads in a row fail. The message includes the build URL. After a successful build, every repo of the chart must have the tag, and the tag must not be an alias that the gate made. Otherwise the gate denies the deploy, because the pipeline did not push `imageTag`.
+   The gate polls the build and streams progress. It denies the deploy when the build fails, is canceled, does not start within `QUEUE_TIMEOUT_MINUTES` (when set), does not finish within `BUILD_TIMEOUT_MINUTES`, or when 5 status reads in a row fail. The message includes the build URL. While the build waits for a free agent, the progress lines say so (one line per minute). The gate never cancels a build: a build that is still queued runs later, and the next deploy reuses the build or its image. Note: in a multi-stage pipeline, the build is `inProgress` while a later job waits for an agent. That wait counts against `BUILD_TIMEOUT_MINUTES`. After a successful build, every repo of the chart must have the tag, and the tag must not be an alias that the gate made. Otherwise the gate denies the deploy, because the pipeline did not push `imageTag`.
 
 When one chart fails, the gate stops the other charts and denies the deploy. When the caller goes away, the gate stops polling.
 
@@ -163,7 +163,8 @@ When `REGISTRY_AUTH` or `ADO_AUTH` is not set, the gate uses workload identity i
 | `ALIAS_MARKER_SUFFIX` | `.alias` | Suffix of the alias marker tag. Starts with `.`, `-` or `_`; at most 32 characters of `[a-zA-Z0-9._-]`. Tags with this suffix are protected. |
 | `PIPELINE_SOURCE_BRANCH` | `refs/heads/main` | Ref of the pipeline repo for queued builds |
 | `POLL_INTERVAL_SECONDS` | `15` | Seconds between build status polls |
-| `BUILD_TIMEOUT_MINUTES` | `25` | Maximum wait for one build |
+| `BUILD_TIMEOUT_MINUTES` | `25` | Maximum run time of one build. With `QUEUE_TIMEOUT_MINUTES` `0`, the time in the queue counts too. |
+| `QUEUE_TIMEOUT_MINUTES` | `0` | Maximum time that one build waits in the queue for a free agent. Then `BUILD_TIMEOUT_MINUTES` counts from the build start. `0`: no separate limit. |
 | `CACHE_TTL_MINUTES` | `5` | Minutes to cache found branch images |
 | `REBUILD_ON_NEW_COMMIT` | `true` | `true` builds a branch image again when its label `org.opencontainers.image.revision` is not the branch head. `false` keeps every real image. With another value, the gate does not start. |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `30` | On SIGTERM, time that in-flight hooks get to finish |
@@ -211,4 +212,4 @@ Merge this into k8s-stack-manager's hooks configuration:
 }
 ```
 
-`timeout_seconds: 1800` (30 minutes, the maximum in k8s-stack-manager) gives room for a build of `BUILD_TIMEOUT_MINUTES`. `failure_policy: fail` blocks the deploy when a build fails or the gate is not reachable. Older k8s-stack-manager versions limit `timeout_seconds` to 600 and do not send `image_tag`. With them, set `timeout_seconds` to 600 and `BUILD_TIMEOUT_MINUTES` to less than 10. The gate then computes the tag itself.
+`timeout_seconds` must be longer than the wait of the gate. One build waits at most `BUILD_TIMEOUT_MINUTES`, plus `QUEUE_TIMEOUT_MINUTES` when it is set. Keep at least 2 minutes of margin for status reads and image checks. When `timeout_seconds` ends first, the deploy fails with a hook timeout instead of the gate message. `timeout_seconds: 1800` (30 minutes) fits one build with the defaults. k8s-stack-manager v0.12.0 (the next release) and later allow up to 3600 (60 minutes), for example with `QUEUE_TIMEOUT_MINUTES: "30"` and `BUILD_TIMEOUT_MINUTES: "25"`. Older versions refuse a value above 1800, and the backend does not start. A chart that builds twice (see `REBUILD_ON_NEW_COMMIT`) can wait twice as long. No allowed `timeout_seconds` covers two full waits, so that rare case ends with a hook timeout. The next deploy then finds the image. `failure_policy: fail` blocks the deploy when a build fails or the gate is not reachable. Older k8s-stack-manager versions limit `timeout_seconds` to 600 and do not send `image_tag`. With them, set `timeout_seconds` to 600 and `BUILD_TIMEOUT_MINUTES` to less than 10. The gate then computes the tag itself.

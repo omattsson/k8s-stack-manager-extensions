@@ -271,7 +271,7 @@ func TestHook_ReusedOldBuildBuildsAgain(t *testing.T) {
 	if !res.resp.Allowed {
 		t.Fatalf("resp = %+v\n%s", res.resp, res.logText())
 	}
-	for _, want := range []string{"Reusing running build #8", "Reused build #8 pushed dev/api:feature-x from commit bbbbbbbb, but the branch is at aaaaaaaa; building again", "Queued build #101"} {
+	for _, want := range []string{"Reusing build #8 (inProgress", "Reused build #8 pushed dev/api:feature-x from commit bbbbbbbb, but the branch is at aaaaaaaa; building again", "Queued build #101"} {
 		if !strings.Contains(res.logText(), want) {
 			t.Errorf("logs do not contain %q:\n%s", want, res.logText())
 		}
