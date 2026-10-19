@@ -41,6 +41,11 @@ data:
   PIPELINE_SOURCE_BRANCH: "refs/heads/main"
   POLL_INTERVAL_SECONDS: "15"
   BUILD_TIMEOUT_MINUTES: "25"
+  # Maximum minutes that a build waits for a free agent. Then
+  # BUILD_TIMEOUT_MINUTES counts from the build start. 0: the queue time
+  # counts against BUILD_TIMEOUT_MINUTES. Keep timeout_seconds of the hook
+  # subscription above the sum.
+  QUEUE_TIMEOUT_MINUTES: "0"
   CACHE_TTL_MINUTES: "5"
   # Build a branch image again when its revision label is not the branch head.
   REBUILD_ON_NEW_COMMIT: "true"

@@ -926,7 +926,7 @@ func TestHook_ReusesRunningBuild(t *testing.T) {
 	if e.ado.queuedCount() != 0 {
 		t.Errorf("queued = %d, want 0", e.ado.queuedCount())
 	}
-	if !strings.Contains(res.logText(), "Reusing running build #8") {
+	if !strings.Contains(res.logText(), "Reusing build #8 (inProgress") {
 		t.Errorf("logs:\n%s", res.logText())
 	}
 }

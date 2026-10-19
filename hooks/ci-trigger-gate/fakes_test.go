@@ -300,6 +300,7 @@ type fakeBuild struct {
 	onSuccess   func()
 	definition  int
 	pollsLeft   int
+	queueLeft   int // reads that still show notStarted; -1 is forever
 	id          int
 }
 
@@ -327,9 +328,12 @@ type fakeADO struct {
 	failBuildGets bool
 	// queuePolls is the number of status reads before a queued build ends.
 	queuePolls int
-	buildGets  int
-	nextID     int
-	mu         sync.Mutex
+	// queueWaitPolls is the number of status reads during which a queued
+	// build waits for an agent (notStarted) before it runs. -1 is forever.
+	queueWaitPolls int
+	buildGets      int
+	nextID         int
+	mu             sync.Mutex
 }
 
 func newFakeADO(t *testing.T) *fakeADO {
@@ -435,6 +439,7 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 			status:      "notStarted",
 			tp:          q.TemplateParameters,
 			pollsLeft:   f.queuePolls,
+			queueLeft:   f.queueWaitPolls,
 			finalResult: f.nextResult,
 		}
 		if f.onQueueSuccess != nil {
@@ -454,6 +459,13 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 		b, ok := f.builds[id]
 		if !ok {
 			http.NotFound(w, r)
+			return
+		}
+		if b.status == "notStarted" && b.queueLeft != 0 {
+			if b.queueLeft > 0 {
+				b.queueLeft--
+			}
+			json.NewEncoder(w).Encode(f.buildJSON(b, true))
 			return
 		}
 		if b.status != "completed" && b.pollsLeft >= 0 {
