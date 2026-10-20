@@ -401,30 +401,49 @@ func TestJobStore_Reserve(t *testing.T) {
 	s := newJobStore(2)
 	s.add(finishedJob("older", "a", now.Add(-2*time.Hour)))
 	s.add(finishedJob("newer", "b", now.Add(-time.Hour)))
-	if !s.reserve() {
-		t.Fatal("reserve = false with finished jobs")
+	if err := s.reserve(0); err != nil {
+		t.Fatalf("reserve = %v with finished jobs", err)
 	}
 	if s.get("older") != nil || s.get("newer") == nil {
 		t.Errorf("jobs = %v", s.jobs)
 	}
 	// The reservation counts: the store holds one job and one reservation.
-	if !s.reserve() {
-		t.Fatal("reserve = false, want the newer finished job removed")
+	if err := s.reserve(0); err != nil {
+		t.Fatalf("reserve = %v, want the newer finished job removed", err)
 	}
-	if s.reserve() {
-		t.Error("reserve = true with two reservations in a store of 2")
+	if err := s.reserve(0); !errors.Is(err, errStoreFull) {
+		t.Errorf("reserve = %v with two reservations in a store of 2", err)
 	}
 	s.release()
-	if !s.reserve() {
-		t.Error("reserve = false after release")
+	if err := s.reserve(0); err != nil {
+		t.Errorf("reserve = %v after release", err)
 	}
 	s.add(&job{id: "r1", instanceID: "x", status: jobRunning})
 	s.add(&job{id: "r2", instanceID: "y", status: jobRunning})
 	if s.reserved != 0 || len(s.jobs) != 2 {
 		t.Errorf("reserved = %d, jobs = %d", s.reserved, len(s.jobs))
 	}
-	if s.reserve() {
-		t.Error("reserve = true with only running jobs")
+	if err := s.reserve(0); !errors.Is(err, errStoreFull) {
+		t.Errorf("reserve = %v with only running jobs", err)
+	}
+}
+
+func TestJobStore_ReserveRunningCap(t *testing.T) {
+	t.Parallel()
+	s := newJobStore(maxJobs)
+	s.add(&job{id: "r1", instanceID: "a", status: jobRunning})
+	s.add(finishedJob("f1", "b", time.Now()))
+	// One running job and no reservation: a cap of 2 has room for one more.
+	if err := s.reserve(2); err != nil {
+		t.Fatalf("reserve = %v", err)
+	}
+	// The reservation counts against the cap.
+	if err := s.reserve(2); !errors.Is(err, errTooManyRunning) {
+		t.Errorf("reserve = %v, want errTooManyRunning", err)
+	}
+	s.release()
+	if err := s.reserve(0); err != nil {
+		t.Errorf("reserve without a cap = %v", err)
 	}
 }
 

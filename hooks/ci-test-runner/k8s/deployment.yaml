@@ -31,17 +31,41 @@ metadata:
 data:
   ADO_ORG: "REPLACE_ME"
   ADO_PROJECT: "REPLACE_ME"
-  # Suite name to pipeline. The suite names must match the "options" of the
-  # suite parameter in hooks-config.json. source_branch is optional.
+  # Suite name to pipeline. With two or more suites, the suite names must
+  # match the "options" of the suite parameter in hooks-config.json.
+  # template_parameters sends only the parameters that the pipeline
+  # declares (see README.md). source_branch is optional.
   TEST_PIPELINES: |
     {
-      "smoke": {"pipeline_id": 42},
-      "full": {"pipeline_id": 42, "source_branch": "refs/heads/main"}
+      "smoke": {
+        "pipeline_id": 42,
+        "template_parameters": {
+          "stackName": {"from": "instance.name"},
+          "branch": {"from": "instance.branch"},
+          "suite": {"from": "suite"}
+        }
+      },
+      "full": {
+        "pipeline_id": 42,
+        "template_parameters": {
+          "stackName": {"from": "instance.name"},
+          "branch": {"from": "instance.branch"},
+          "suite": {"from": "suite"}
+        }
+      }
     }
-  PIPELINE_SOURCE_BRANCH: "refs/heads/main"
+  # One suite with an optional workers parameter (hooks-config.one-suite.json):
+  # {"e2e": {"pipeline_id": 42, "template_parameters": {
+  #   "stackName": {"from": "instance.name"},
+  #   "workers": {"from": "parameter", "parameter": "workers", "values": ["1", "2", "3"]}}}}
+  # Empty: ADO uses the default branch of the pipeline.
+  PIPELINE_SOURCE_BRANCH: ""
   POLL_INTERVAL_SECONDS: "15"
-  # The web UI stops polling the job log after 60 minutes.
-  TEST_TIMEOUT_MINUTES: "60"
+  # Longer than the run time of the pipeline (at most 240). The web UI stops
+  # polling after 60 minutes; a new "Run tests" returns the running job.
+  TEST_TIMEOUT_MINUTES: "120"
+  # Maximum running jobs. 0: no cap.
+  MAX_RUNNING_JOBS: "3"
   JOB_RETENTION_HOURS: "24"
   SHUTDOWN_TIMEOUT_SECONDS: "30"
   # Client ID of the managed identity or app registration with the

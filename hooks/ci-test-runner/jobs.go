@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -118,6 +120,14 @@ func (j *job) read(offset int) ([]byte, string) {
 	return bytes.Clone(j.log[offset:]), j.status
 }
 
+// number returns the build number, or "#<build id>" without one.
+func (j *job) number() string {
+	if j.buildNumber != "" {
+		return j.buildNumber
+	}
+	return "#" + strconv.Itoa(j.buildID)
+}
+
 // state returns the status and the finish time.
 func (j *job) state() (string, time.Time) {
 	j.mu.Lock()
@@ -164,13 +174,32 @@ func (s *jobStore) running(instanceID string) *job {
 	return j
 }
 
-// reserve takes a slot for one new job. When the store is full, it removes
-// the oldest finished jobs first. It returns false when all slots hold
-// running jobs or other reservations. After true, the caller must call add
-// or release.
-func (s *jobStore) reserve() bool {
+// Reservation errors.
+var (
+	// errStoreFull: all slots hold running jobs or other reservations.
+	errStoreFull = errors.New("job store is full")
+	// errTooManyRunning: MAX_RUNNING_JOBS jobs run or are reserved.
+	errTooManyRunning = errors.New("too many running jobs")
+)
+
+// reserve takes a slot for one new job. maxRunning (0: no cap) limits the
+// running jobs plus the reservations. When the store is full, reserve
+// removes the oldest finished jobs first. After nil, the caller must call
+// add or release.
+func (s *jobStore) reserve(maxRunning int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if maxRunning > 0 {
+		running := s.reserved
+		for _, j := range s.jobs {
+			if status, _ := j.state(); status == jobRunning {
+				running++
+			}
+		}
+		if running >= maxRunning {
+			return errTooManyRunning
+		}
+	}
 	for len(s.jobs)+s.reserved >= s.max {
 		var oldest *job
 		var oldestAt time.Time
@@ -184,12 +213,12 @@ func (s *jobStore) reserve() bool {
 			}
 		}
 		if oldest == nil {
-			return false
+			return errStoreFull
 		}
 		s.removeLocked(oldest)
 	}
 	s.reserved++
-	return true
+	return nil
 }
 
 // release gives back a reserved slot, for example when the queue call fails.
@@ -392,6 +421,12 @@ func nextPollDelay(delay, max, retryAfter time.Duration) time.Duration {
 
 // complete writes the result lines of a completed build and ends the job.
 // A failed test run read is a log line, not a job failure.
+//
+// A report-only pipeline gives partiallySucceeded for a red suite, and a
+// warning step gives the same result. So for partiallySucceeded the test
+// counts decide: passed tests and no failed tests give succeeded; failed
+// tests, no test results or no passed tests give failed. When the test runs
+// cannot be read, the result is unknown.
 func (h *handler) complete(ctx context.Context, j *job, b *buildInfo) {
 	result := b.Result
 	if result == "" {
@@ -399,6 +434,7 @@ func (h *handler) complete(ctx context.Context, j *job, b *buildInfo) {
 	}
 	j.logf("Build finished: %s", result)
 
+	passed, failed := 0, 0
 	runs, err := h.ci.testRuns(ctx, buildURI(b))
 	switch {
 	case err != nil:
@@ -407,12 +443,23 @@ func (h *handler) complete(ctx context.Context, j *job, b *buildInfo) {
 	case len(runs) == 0:
 		j.logf("No test results published")
 	default:
-		passed, failed, other := summarize(runs)
+		var other int
+		passed, failed, other = summarize(runs)
 		j.logf("Tests: %d passed, %d failed, %d other", passed, failed, other)
 		j.logf("Test results: %s", testResultsLink(j.buildURL))
 	}
 
 	status := mapBuildResult(b.Result)
+	if b.Result == "partiallySucceeded" {
+		switch {
+		case err != nil:
+			status = jobUnknown
+			j.logf("The build finished with warnings or failed tests. See the run page: %s", j.buildURL)
+		case len(runs) > 0 && failed == 0 && passed > 0:
+			status = jobSucceeded
+			j.logf("Build finished with warnings. See the run page: %s", j.buildURL)
+		}
+	}
 	j.finish(status)
 	slog.Info("job finished", "job", j.id, "instance", j.instanceName, "build_id", j.buildID, "result", result, "status", status)
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -20,11 +21,12 @@ import (
 
 // buildInfo is the subset of an Azure DevOps build that the runner uses.
 type buildInfo struct {
-	BuildNumber string `json:"buildNumber"`
-	Status      string `json:"status"`
-	Result      string `json:"result"`
-	URI         string `json:"uri"` // vstfs:///Build/Build/<id>
-	Links       struct {
+	TemplateParameters map[string]any `json:"templateParameters"`
+	BuildNumber        string         `json:"buildNumber"`
+	Status             string         `json:"status"`
+	Result             string         `json:"result"`
+	URI                string         `json:"uri"` // vstfs:///Build/Build/<id>
+	Links              struct {
 		Web struct {
 			Href string `json:"href"`
 		} `json:"web"`
@@ -45,9 +47,13 @@ type testRun struct {
 
 // ciProvider talks to Azure DevOps. Abstracted for testing.
 type ciProvider interface {
-	// queueBuild queues a build of the pipeline on sourceBranch with the
-	// template parameters params.
+	// queueBuild queues a build of the pipeline with the template
+	// parameters params. An empty sourceBranch uses the default branch of
+	// the pipeline.
 	queueBuild(ctx context.Context, pipelineID int, sourceBranch string, params map[string]string) (*buildInfo, error)
+	// findRunningBuild returns a build of the pipeline that is not completed
+	// and whose template parameters have all values of match, or nil.
+	findRunningBuild(ctx context.Context, pipelineID int, match map[string]string) (*buildInfo, error)
 	// getBuild returns the current state of a build.
 	getBuild(ctx context.Context, buildID int) (*buildInfo, error)
 	// testRuns returns the test runs that a build published.
@@ -209,10 +215,15 @@ func (a *adoClient) doJSON(ctx context.Context, method, u string, in, out any) e
 }
 
 func (a *adoClient) queueBuild(ctx context.Context, pipelineID int, sourceBranch string, params map[string]string) (*buildInfo, error) {
-	body := map[string]any{
-		"definition":         map[string]int{"id": pipelineID},
-		"sourceBranch":       sourceBranch,
-		"templateParameters": params,
+	// Send only what is set: ADO refuses a template parameter that the
+	// pipeline does not declare, and uses the default branch of the
+	// pipeline without sourceBranch.
+	body := map[string]any{"definition": map[string]int{"id": pipelineID}}
+	if sourceBranch != "" {
+		body["sourceBranch"] = sourceBranch
+	}
+	if len(params) > 0 {
+		body["templateParameters"] = params
 	}
 	var b buildInfo
 	if err := a.doJSON(ctx, http.MethodPost, a.buildsURL()+"?api-version=7.1", body, &b); err != nil {
@@ -222,6 +233,67 @@ func (a *adoClient) queueBuild(ctx context.Context, pipelineID int, sourceBranch
 		return nil, errors.New("ADO queue response has no build id")
 	}
 	return &b, nil
+}
+
+// maxBuildReads limits the build reads of findRunningBuild for list entries
+// without template parameters.
+const maxBuildReads = 20
+
+// matchesParams reports whether the template parameters of b have the value
+// of each key of match. ADO sends template parameter values as strings.
+func matchesParams(b *buildInfo, match map[string]string) bool {
+	for k, want := range match {
+		if v, ok := b.TemplateParameters[k].(string); !ok || v != want {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *adoClient) findRunningBuild(ctx context.Context, pipelineID int, match map[string]string) (*buildInfo, error) {
+	q := url.Values{
+		"definitions":  {strconv.Itoa(pipelineID)},
+		"statusFilter": {"inProgress,notStarted,postponed"},
+		"api-version":  {"7.1"},
+	}
+	var result struct {
+		Value []buildInfo `json:"value"`
+	}
+	if err := a.doJSON(ctx, http.MethodGet, a.buildsURL()+"?"+q.Encode(), nil, &result); err != nil {
+		return nil, err
+	}
+	reads := 0
+	for i := range result.Value {
+		b := &result.Value[i]
+		if b.Status == "completed" {
+			continue
+		}
+		if b.TemplateParameters == nil {
+			// The list can omit template parameters. Read the build itself,
+			// up to maxBuildReads times. Entries with template parameters
+			// still count after the limit.
+			if reads >= maxBuildReads {
+				continue
+			}
+			reads++
+			full, err := a.getBuild(ctx, b.ID)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, err
+				}
+				slog.Warn("cannot read a running build; skipping it", "build_id", b.ID, "error", err)
+				continue
+			}
+			b = full
+			if b.Status == "completed" {
+				continue
+			}
+		}
+		if matchesParams(b, match) {
+			return b, nil
+		}
+	}
+	return nil, nil
 }
 
 func (a *adoClient) getBuild(ctx context.Context, buildID int) (*buildInfo, error) {

@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -58,7 +59,7 @@ type InstanceRef struct {
 type actionResponse struct {
 	JobID    string `json:"job_id"`
 	Status   string `json:"status"`
-	Suite    string `json:"suite"`
+	Suite    string `json:"suite,omitempty"`
 	BuildURL string `json:"build_url"`
 	Message  string `json:"message,omitempty"`
 	BuildID  int    `json:"build_id"`
@@ -78,6 +79,9 @@ const (
 	// lock of the instance and the queue call. The runner answers before
 	// the action timeout of the backend (timeout_seconds 30).
 	requestTimeout = 25 * time.Second
+	// adoptTimeout limits the lookup of a running build of the stack, so the
+	// queue call keeps at least 15 seconds of requestTimeout.
+	adoptTimeout = 8 * time.Second
 	// replayWindow is the time that the runner remembers a request_id.
 	replayWindow = 10 * time.Minute
 	// maxRequestIDLength limits a remembered request_id.
@@ -86,10 +90,16 @@ const (
 	jobStopTimeout = 5 * time.Second
 )
 
+// maxTestTimeout is the maximum of TEST_TIMEOUT_MINUTES.
+const maxTestTimeout = 240 * time.Minute
+
 // suiteConfig is one entry of TEST_PIPELINES.
 type suiteConfig struct {
-	SourceBranch string `json:"source_branch"`
-	PipelineID   int    `json:"pipeline_id"`
+	// TemplateParameters maps pipeline template parameters to their source.
+	// nil sends stackName, namespace, branch and suite.
+	TemplateParameters map[string]paramMapping `json:"template_parameters"`
+	SourceBranch       string                  `json:"source_branch"`
+	PipelineID         int                     `json:"pipeline_id"`
 }
 
 type config struct {
@@ -115,8 +125,10 @@ type config struct {
 	// MaxPollBackoff is the longest wait between two reads after errors.
 	MaxPollBackoff time.Duration
 	// MaxLogBytes caps the log of one job.
-	MaxLogBytes   int
-	AllowUnsigned bool
+	MaxLogBytes int
+	// MaxRunningJobs caps the running jobs (0: no cap).
+	MaxRunningJobs int
+	AllowUnsigned  bool
 }
 
 // loadConfig reads the configuration from getenv.
@@ -135,7 +147,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		ADOProject:           get("ADO_PROJECT", ""),
 		ADOPAT:               getenv("ADO_PAT"),
 		AzureClientID:        get("AZURE_CLIENT_ID", ""),
-		PipelineSourceBranch: get("PIPELINE_SOURCE_BRANCH", "refs/heads/main"),
+		PipelineSourceBranch: get("PIPELINE_SOURCE_BRANCH", ""),
 		PollInterval:         time.Duration(envInt(get, "POLL_INTERVAL_SECONDS", 15, 1)) * time.Second,
 		TestTimeout:          time.Duration(envInt(get, "TEST_TIMEOUT_MINUTES", 60, 1)) * time.Minute,
 		JobRetention:         time.Duration(envInt(get, "JOB_RETENTION_HOURS", 24, 1)) * time.Hour,
@@ -153,8 +165,18 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if cfg.ADOOrg == "" || cfg.ADOProject == "" {
 		return config{}, errors.New("ADO_ORG and ADO_PROJECT must be set")
 	}
-	if !validRef(cfg.PipelineSourceBranch) {
+	if cfg.PipelineSourceBranch != "" && !validRef(cfg.PipelineSourceBranch) {
 		return config{}, fmt.Errorf("PIPELINE_SOURCE_BRANCH %q must be a ref such as refs/heads/main", cfg.PipelineSourceBranch)
+	}
+	if v := get("MAX_RUNNING_JOBS", "0"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return config{}, fmt.Errorf("MAX_RUNNING_JOBS %q must be a whole number, 0 or higher (0: no cap)", v)
+		}
+		cfg.MaxRunningJobs = n
+	}
+	if cfg.TestTimeout > maxTestTimeout {
+		return config{}, fmt.Errorf("TEST_TIMEOUT_MINUTES must be at most %d", int(maxTestTimeout/time.Minute))
 	}
 
 	suites, err := parseTestPipelines(getenv("TEST_PIPELINES"))
@@ -190,7 +212,8 @@ func envInt(get func(string, string) string, key string, fallback, min int) int 
 var suiteNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
 // parseTestPipelines parses TEST_PIPELINES: a JSON object from suite name to
-// {"pipeline_id": 42, "source_branch": "refs/heads/main"}. source_branch is
+// {"pipeline_id": 42, "source_branch": "refs/heads/main",
+// "template_parameters": {...}}. source_branch and template_parameters are
 // optional.
 func parseTestPipelines(s string) (map[string]suiteConfig, error) {
 	if strings.TrimSpace(s) == "" {
@@ -217,6 +240,9 @@ func parseTestPipelines(s string) (map[string]suiteConfig, error) {
 		}
 		if sc.SourceBranch != "" && !validRef(sc.SourceBranch) {
 			return nil, fmt.Errorf("TEST_PIPELINES: suite %q: source_branch %q must be a ref such as refs/heads/main", name, sc.SourceBranch)
+		}
+		if err := validateMappings(sc.TemplateParameters); err != nil {
+			return nil, fmt.Errorf("TEST_PIPELINES: suite %q: %w", name, err)
 		}
 	}
 	return suites, nil
@@ -337,8 +363,11 @@ type handler struct {
 	// requestTimeout limits POST /action (default requestTimeout). Tests
 	// make it short.
 	requestTimeout time.Duration
-	wg             sync.WaitGroup
-	mu             sync.Mutex
+	// adoptTimeout limits the lookup of a running build (default
+	// adoptTimeout).
+	adoptTimeout time.Duration
+	wg           sync.WaitGroup
+	mu           sync.Mutex
 	// stopped is true after stop. No new goroutine starts then.
 	stopped bool
 }
@@ -368,6 +397,7 @@ func newHandler(cfg config, ci ciProvider) *handler {
 		now:     time.Now,
 
 		requestTimeout: requestTimeout,
+		adoptTimeout:   adoptTimeout,
 	}
 }
 
@@ -383,43 +413,46 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// selectSuite reads parameters.suite. It returns a message for the user
-// when the suite is missing or unknown.
+// selectSuite reads parameters.suite. With one suite, the parameter is
+// optional. It returns a message for the user when the suite is missing or
+// unknown.
 func (h *handler) selectSuite(params map[string]any) (string, suiteConfig, string) {
-	names := strings.Join(h.cfg.suiteNames(), ", ")
-	v, ok := params["suite"]
-	if !ok || v == nil {
-		return "", suiteConfig{}, "Select a test suite (parameter suite). Suites: " + names
+	names := h.cfg.suiteNames()
+	list := strings.Join(names, ", ")
+	name := ""
+	switch v := params["suite"].(type) {
+	case nil:
+	case string:
+		name = strings.TrimSpace(v)
+	default:
+		return "", suiteConfig{}, "The parameter suite must be a string. Suites: " + list
 	}
-	name, ok := v.(string)
-	if !ok {
-		return "", suiteConfig{}, "The parameter suite must be a string. Suites: " + names
-	}
-	name = strings.TrimSpace(name)
 	if name == "" {
-		return "", suiteConfig{}, "Select a test suite (parameter suite). Suites: " + names
+		if len(names) == 1 {
+			return names[0], h.cfg.Suites[names[0]], ""
+		}
+		return "", suiteConfig{}, "Select a test suite (parameter suite). Suites: " + list
 	}
 	sc, ok := h.cfg.Suites[name]
 	if !ok {
 		if len(name) > 40 {
 			name = name[:40] + "..."
 		}
-		return "", suiteConfig{}, fmt.Sprintf("Unknown suite %q. Suites: %s", name, names)
+		return "", suiteConfig{}, fmt.Sprintf("Unknown suite %q. Suites: %s", name, list)
 	}
 	return name, sc, ""
 }
 
-// checkInstance checks the instance fields that go to the pipeline. It
-// returns a message for the user, or "".
+// checkInstance checks the instance fields that can go to the pipeline. It
+// returns a message for the user, or "". An empty branch is valid: the
+// runner then does not send it.
 func checkInstance(inst *InstanceRef, branch string) string {
 	switch {
 	case !validLabel(inst.Name):
 		return "The stack name is not a valid RFC 1123 label (lowercase letters, digits and '-', at most 63 characters)"
 	case !validLabel(inst.Namespace):
 		return "The stack namespace is not a valid RFC 1123 label (lowercase letters, digits and '-', at most 63 characters)"
-	case branch == "":
-		return "The stack has no branch"
-	case !validBranch(branch):
+	case branch != "" && !validBranch(branch):
 		return "The branch is not allowed: use only letters, digits, '.', '_', '-' and '/', no '..', and no leading '-' or '/'"
 	}
 	return ""
@@ -467,8 +500,15 @@ func (h *handler) actionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// UseNumber keeps integer parameters exact (see actionParamValue).
 	var req ActionRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -518,6 +558,12 @@ func (h *handler) actionHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
+	mapping := suite.mappings()
+	params, msg := templateParams(mapping, inst, branch, suiteName, req.Parameters)
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
 	if h.isStopping() {
 		writeError(w, http.StatusServiceUnavailable, "The test runner is stopping. Try again in a moment.")
 		return
@@ -546,20 +592,47 @@ func (h *handler) actionHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if !h.store.reserve() {
+	switch err := h.store.reserve(h.cfg.MaxRunningJobs); {
+	case errors.Is(err, errTooManyRunning):
+		writeError(w, http.StatusTooManyRequests, runningCapMessage(h.cfg.MaxRunningJobs))
+		return
+	case err != nil:
 		writeError(w, http.StatusServiceUnavailable, "Too many test runs. Try again later.")
 		return
+	}
+
+	// Adopt a build of this stack that runs in Azure DevOps: after a restart
+	// of the runner, or a run that somebody started by hand. The lookup has
+	// its own time limit, so the queue call keeps most of the request
+	// budget. A failed or slow lookup does not block the queue call.
+	if match := adoptionMatch(mapping, inst); match != nil {
+		lookupCtx, cancelLookup := context.WithTimeout(ctx, h.adoptTimeout)
+		b, err := h.ci.findRunningBuild(lookupCtx, suite.PipelineID, match)
+		cancelLookup()
+		switch {
+		case err != nil:
+			logger.Warn("cannot list the running builds; queueing a new build", "pipeline_id", suite.PipelineID, "error", err)
+		case b != nil:
+			adoptedSuite := h.adoptedSuite(mapping, b)
+			j := h.newJob(inst, adoptedSuite, suite.PipelineID, b)
+			j.logf("Found build %s of pipeline %d for this stack, started before this request: %s", j.number(), j.pipelineID, j.buildURL)
+			h.addAndStart(j)
+			logger.Info("adopted running test build", "job", j.id, "pipeline_id", j.pipelineID, "build_id", j.buildID)
+			writeJSON(w, http.StatusOK, actionResponse{
+				JobID:    j.id,
+				Status:   jobRunning,
+				Suite:    adoptedSuite,
+				BuildID:  j.buildID,
+				BuildURL: j.buildURL,
+				Message:  "A test run for this stack is already in progress in Azure DevOps. This is its log.",
+			})
+			return
+		}
 	}
 
 	sourceBranch := suite.SourceBranch
 	if sourceBranch == "" {
 		sourceBranch = h.cfg.PipelineSourceBranch
-	}
-	params := map[string]string{
-		"stackName": inst.Name,
-		"namespace": inst.Namespace,
-		"branch":    branch,
-		"suite":     suiteName,
 	}
 	b, err := h.ci.queueBuild(ctx, suite.PipelineID, sourceBranch, params)
 	if err != nil {
@@ -569,29 +642,9 @@ func (h *handler) actionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	j := &job{
-		id:           newJobID(),
-		instanceID:   inst.ID,
-		instanceName: inst.Name,
-		suite:        suiteName,
-		buildID:      b.ID,
-		buildNumber:  b.BuildNumber,
-		buildURL:     h.ci.buildLink(b),
-		pipelineID:   suite.PipelineID,
-		status:       jobRunning,
-		maxLog:       h.cfg.MaxLogBytes,
-	}
-	number := j.buildNumber
-	if number == "" {
-		number = "#" + strconv.Itoa(j.buildID)
-	}
-	j.logf("Queued build %s of pipeline %d (suite %s): %s", number, j.pipelineID, suiteName, j.buildURL)
-	h.store.add(j)
-	if !h.startJob(j) {
-		// stop started during the queue call. The build exists, so the
-		// answer still has the job and the build link.
-		h.end(j, jobUnknown, "The test runner stopped before it could follow the build. The build continues: "+j.buildURL)
-	}
+	j := h.newJob(inst, suiteName, suite.PipelineID, b)
+	j.logf("Queued build %s of pipeline %d (suite %s): %s", j.number(), j.pipelineID, suiteName, j.buildURL)
+	h.addAndStart(j)
 	logger.Info("queued test build", "job", j.id, "suite", suiteName, "pipeline_id", j.pipelineID, "build_id", j.buildID)
 
 	writeJSON(w, http.StatusAccepted, actionResponse{
@@ -601,6 +654,55 @@ func (h *handler) actionHandler(w http.ResponseWriter, r *http.Request) {
 		BuildID:  j.buildID,
 		BuildURL: j.buildURL,
 	})
+}
+
+// adoptedSuite returns the suite of an adopted build: the value of the
+// template parameter that gets the suite, when it is a valid suite name.
+// Otherwise it is the only configured suite, or "".
+func (h *handler) adoptedSuite(m map[string]paramMapping, b *buildInfo) string {
+	if sp := firstParameter(m, fromSuite); sp != "" {
+		if s, ok := b.TemplateParameters[sp].(string); ok && suiteNameRe.MatchString(s) {
+			return s
+		}
+	}
+	if names := h.cfg.suiteNames(); len(names) == 1 {
+		return names[0]
+	}
+	return ""
+}
+
+// runningCapMessage is the 429 text at MAX_RUNNING_JOBS.
+func runningCapMessage(n int) string {
+	if n == 1 {
+		return "1 test run is in progress. Try again later."
+	}
+	return fmt.Sprintf("%d test runs are in progress. Try again later.", n)
+}
+
+// newJob returns a running job that follows build b.
+func (h *handler) newJob(inst *InstanceRef, suite string, pipelineID int, b *buildInfo) *job {
+	return &job{
+		id:           newJobID(),
+		instanceID:   inst.ID,
+		instanceName: inst.Name,
+		suite:        suite,
+		buildID:      b.ID,
+		buildNumber:  b.BuildNumber,
+		buildURL:     h.ci.buildLink(b),
+		pipelineID:   pipelineID,
+		status:       jobRunning,
+		maxLog:       h.cfg.MaxLogBytes,
+	}
+}
+
+// addAndStart stores j in its reserved slot and starts to follow the build.
+func (h *handler) addAndStart(j *job) {
+	h.store.add(j)
+	if !h.startJob(j) {
+		// stop started during the ADO call. The build exists, so the answer
+		// still has the job and the build link.
+		h.end(j, jobUnknown, "The test runner stopped before it could follow the build. The build continues: "+j.buildURL)
+	}
 }
 
 // jobLogHandler handles GET /jobs/{job_id}/log?instance_id=&offset=&ts=.
@@ -715,6 +817,7 @@ func main() {
 		"pipeline_source_branch", cfg.PipelineSourceBranch,
 		"poll_interval", cfg.PollInterval,
 		"test_timeout", cfg.TestTimeout,
+		"max_running_jobs", cfg.MaxRunningJobs,
 		"job_retention", cfg.JobRetention,
 		"shutdown_timeout", cfg.ShutdownTimeout,
 	)

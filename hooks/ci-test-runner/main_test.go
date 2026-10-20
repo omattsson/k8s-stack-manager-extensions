@@ -47,7 +47,7 @@ func TestLoadConfig(t *testing.T) {
 			name: "defaults",
 			env:  nil,
 			check: func(t *testing.T, c config) {
-				if c.ListenAddr != ":8080" || c.PipelineSourceBranch != "refs/heads/main" || c.ADOAuth != authPAT {
+				if c.ListenAddr != ":8080" || c.PipelineSourceBranch != "" || c.ADOAuth != authPAT || c.MaxRunningJobs != 0 {
 					t.Errorf("config = %+v", c)
 				}
 				if c.PollInterval != 15*time.Second || c.TestTimeout != 60*time.Minute ||
@@ -82,7 +82,7 @@ func TestLoadConfig(t *testing.T) {
 					c.JobRetention != 2*time.Hour || c.ShutdownTimeout != 0 {
 					t.Errorf("durations = %s %s %s %s", c.PollInterval, c.TestTimeout, c.JobRetention, c.ShutdownTimeout)
 				}
-				if c.Suites["full"] != (suiteConfig{PipelineID: 43, SourceBranch: "refs/heads/tests"}) {
+				if f := c.Suites["full"]; f.PipelineID != 43 || f.SourceBranch != "refs/heads/tests" || f.TemplateParameters != nil {
 					t.Errorf("suites = %+v", c.Suites)
 				}
 				if got := strings.Join(c.suiteNames(), ","); got != "full,smoke" {
@@ -454,7 +454,6 @@ func TestAction_BadRequests(t *testing.T) {
 		{name: "invalid name", inst: with(func(i *InstanceRef) { i.Name = "Demo;rm" }), params: smoke, want: http.StatusBadRequest, wantMsg: "stack name"},
 		{name: "long name", inst: with(func(i *InstanceRef) { i.Name = strings.Repeat("a", 64) }), params: smoke, want: http.StatusBadRequest, wantMsg: "stack name"},
 		{name: "invalid namespace", inst: with(func(i *InstanceRef) { i.Namespace = "stack_demo" }), params: smoke, want: http.StatusBadRequest, wantMsg: "namespace"},
-		{name: "no branch", inst: with(func(i *InstanceRef) { i.Branch = "" }), params: smoke, want: http.StatusBadRequest, wantMsg: "no branch"},
 		{name: "invalid branch", inst: with(func(i *InstanceRef) { i.Branch = "x$(id)" }), params: smoke, want: http.StatusBadRequest, wantMsg: "branch is not allowed"},
 		{name: "branch with dot dot", inst: with(func(i *InstanceRef) { i.Branch = "a/../b" }), params: smoke, want: http.StatusBadRequest, wantMsg: "branch is not allowed"},
 	}
@@ -903,6 +902,7 @@ func TestAction_CapRaceAcrossInstances(t *testing.T) {
 			defer wg.Done()
 			inst := testInstance()
 			inst.ID = "i" + strconv.Itoa(i)
+			inst.Name = "demo" + strconv.Itoa(i)
 			codes[i] = e.post(t, actionBody(&inst, map[string]any{"suite": "smoke"}), "").Code
 		}()
 	}

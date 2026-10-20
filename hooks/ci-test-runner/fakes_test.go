@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,14 +66,18 @@ func (f *fakeCred) count(scope string) int {
 // ---------------------------------------------------------------------------
 
 type fakeBuild struct {
+	tp map[string]string // template parameters
+	// hideTP removes the template parameters of this build from the list.
+	hideTP bool
 	// statuses, when set, are the statuses of the next reads. The last one
 	// stays.
-	statuses  []string
-	status    string
-	result    string // result when the build completes
-	queueLeft int    // reads that still show notStarted; -1 is forever
-	runLeft   int    // reads that show inProgress; -1 is forever
-	id        int
+	statuses   []string
+	definition int
+	status     string
+	result     string // result when the build completes
+	queueLeft  int    // reads that still show notStarted; -1 is forever
+	runLeft    int    // reads that show inProgress; -1 is forever
+	id         int
 }
 
 type queuedBuild struct {
@@ -83,7 +89,24 @@ type queuedBuild struct {
 }
 
 type fakeADO struct {
-	builds     map[int]*fakeBuild
+	builds map[int]*fakeBuild
+	// declared, when set for a pipeline, are its template parameters. Like
+	// ADO, the fake refuses a queue call with another parameter (400).
+	declared map[int][]string
+	// queuedRaw are the raw bodies of the queue calls.
+	queuedRaw []map[string]any
+	// listQueries are the queries of the build list calls.
+	listQueries []url.Values
+	// failList makes the build list fail with 500.
+	failList bool
+	// omitListTP removes the template parameters from the build list.
+	omitListTP bool
+	// listDelay delays the build list.
+	listDelay time.Duration
+	// missingIDs are builds whose read gives 404.
+	missingIDs map[int]bool
+	// readIDs are the IDs of the build reads.
+	readIDs    []int
 	runs       map[string][]testRun // build URI → test runs
 	srv        *httptest.Server
 	nextResult string
@@ -119,6 +142,7 @@ type fakeADO struct {
 func newFakeADO(t *testing.T) *fakeADO {
 	f := &fakeADO{
 		builds:     map[int]*fakeBuild{},
+		declared:   map[int][]string{},
 		runs:       map[string][]testRun{},
 		nextID:     100,
 		nextResult: "succeeded",
@@ -162,7 +186,18 @@ func (f *fakeADO) buildJSON(b *fakeBuild) map[string]any {
 	if b.status == "completed" {
 		out["result"] = b.result
 	}
+	if b.tp != nil {
+		out["templateParameters"] = b.tp
+	}
 	return out
+}
+
+// addRunning adds a build of pipeline def that runs until the test changes
+// it, with the template parameters tp.
+func (f *fakeADO) addRunning(id, def int, tp map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.builds[id] = &fakeBuild{id: id, definition: def, status: "inProgress", runLeft: -1, result: "succeeded", tp: tp}
 }
 
 func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
@@ -188,8 +223,20 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		raw, _ := io.ReadAll(r.Body)
 		var q queuedBuild
-		json.NewDecoder(r.Body).Decode(&q)
+		json.Unmarshal(raw, &q)
+		var rawBody map[string]any
+		json.Unmarshal(raw, &rawBody)
+		f.queuedRaw = append(f.queuedRaw, rawBody)
+		if declared, ok := f.declared[q.Definition.ID]; ok {
+			for name := range q.TemplateParameters {
+				if !slices.Contains(declared, name) {
+					http.Error(w, `{"message":"Unexpected parameter '`+name+`'"}`, http.StatusBadRequest)
+					return
+				}
+			}
+		}
 		if f.queueStatus != 0 || f.failQueues > 0 {
 			status := f.queueStatus
 			if f.failQueues > 0 {
@@ -202,21 +249,63 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 		f.queued = append(f.queued, q)
 		f.nextID++
 		b := &fakeBuild{
-			id:        f.nextID,
-			status:    "notStarted",
-			result:    f.nextResult,
-			queueLeft: f.queueWaitPolls,
-			runLeft:   f.runPolls,
-			statuses:  append([]string(nil), f.nextStatuses...),
+			id:         f.nextID,
+			definition: q.Definition.ID,
+			tp:         q.TemplateParameters,
+			status:     "notStarted",
+			result:     f.nextResult,
+			queueLeft:  f.queueWaitPolls,
+			runLeft:    f.runPolls,
+			statuses:   append([]string(nil), f.nextStatuses...),
 		}
 		f.builds[b.id] = b
 		json.NewEncoder(w).Encode(f.buildJSON(b))
+
+	case path == "/org/proj/_apis/build/builds" && r.Method == http.MethodGet:
+		f.mu.Lock()
+		listDelay := f.listDelay
+		f.mu.Unlock()
+		if listDelay > 0 {
+			select {
+			case <-time.After(listDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.listQueries = append(f.listQueries, r.URL.Query())
+		if f.failList {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		def, _ := strconv.Atoi(r.URL.Query().Get("definitions"))
+		value := []map[string]any{}
+		ids := make([]int, 0, len(f.builds))
+		for id := range f.builds {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		for _, id := range ids {
+			b := f.builds[id]
+			if b.definition != def || b.status == "completed" {
+				continue
+			}
+			out := f.buildJSON(b)
+			if f.omitListTP || b.hideTP {
+				delete(out, "templateParameters")
+			}
+			value = append(value, out)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"value": value, "count": len(value)})
 
 	case strings.HasPrefix(path, "/org/proj/_apis/build/builds/") && r.Method == http.MethodGet:
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.buildGets++
 		f.readTimes = append(f.readTimes, time.Now())
+		readID, _ := strconv.Atoi(strings.TrimPrefix(path, "/org/proj/_apis/build/builds/"))
+		f.readIDs = append(f.readIDs, readID)
 		if f.failBuildGets != 0 {
 			if f.failBuildGets > 0 {
 				f.failBuildGets--
@@ -233,7 +322,7 @@ func (f *fakeADO) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		id, _ := strconv.Atoi(strings.TrimPrefix(path, "/org/proj/_apis/build/builds/"))
 		b, ok := f.builds[id]
-		if !ok {
+		if !ok || f.missingIDs[id] {
 			http.NotFound(w, r)
 			return
 		}
