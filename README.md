@@ -14,6 +14,7 @@ These extensions use the [webhook extension system](https://github.com/omattsson
 | [maintenance-gate](hooks/maintenance-gate/) | Event hook | Python | Block deploys outside business hours, and deploys and rollbacks while a maintenance switch is on |
 | [security-scan-gate](hooks/security-scan-gate/) | Event hook | Go | Block deploys when images have critical CVEs (Trivy) |
 | [debug-bundle](hooks/debug-bundle/) | Action | Go | Collect pod logs, events, and diagnostics into a downloadable archive |
+| [ci-test-runner](hooks/ci-test-runner/) | Action | Go | Run an Azure DevOps test pipeline against a stack and show the progress and test summary in the job log |
 
 ## Quick Start
 
