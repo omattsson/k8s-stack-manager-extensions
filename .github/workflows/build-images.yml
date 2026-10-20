@@ -23,6 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         hook:
+          - ci-test-runner
           - ci-trigger-gate
           - debug-bundle
           - maintenance-gate

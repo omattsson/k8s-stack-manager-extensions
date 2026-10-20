@@ -43,6 +43,23 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+  test-ci-test-runner:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./hooks/ci-test-runner
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: hooks/ci-test-runner/go.mod
+          cache-dependency-path: hooks/ci-test-runner/go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+
   test-python-hooks:
     runs-on: ubuntu-latest
     strategy:

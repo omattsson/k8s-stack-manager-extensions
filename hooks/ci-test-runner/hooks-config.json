@@ -1,0 +1,14 @@
+{
+    "actions": [{
+        "name": "run-tests",
+        "label": "Run tests",
+        "description": "Runs the test pipeline in Azure DevOps against this stack.",
+        "url": "http://ci-test-runner.extensions.svc.cluster.local:8080/action",
+        "secret_env": "CI_TEST_RUNNER_SECRET",
+        "timeout_seconds": 30,
+        "log_path": "/jobs/{job_id}/log",
+        "parameters": [
+            {"name": "suite", "label": "Suite", "type": "enum", "options": ["smoke", "full"], "default": "smoke", "required": true}
+        ]
+    }]
+}

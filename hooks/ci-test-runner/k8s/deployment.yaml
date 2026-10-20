@@ -1,0 +1,171 @@
+# Example deployment with workload identity on a cluster without the Azure
+# workload identity webhook. The pod gets a projected ServiceAccount token
+# and the AZURE_* variables directly. No Azure DevOps secret is needed. See
+# README.md for the federated credential setup.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: extensions
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-test-runner
+  namespace: extensions
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ci-test-runner-secret
+  namespace: extensions
+type: Opaque
+stringData:
+  CI_TEST_RUNNER_SECRET: "REPLACE_ME"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ci-test-runner-config
+  namespace: extensions
+data:
+  ADO_ORG: "REPLACE_ME"
+  ADO_PROJECT: "REPLACE_ME"
+  # Suite name to pipeline. With two or more suites, the suite names must
+  # match the "options" of the suite parameter in hooks-config.json.
+  # template_parameters sends only the parameters that the pipeline
+  # declares (see README.md). source_branch is optional.
+  TEST_PIPELINES: |
+    {
+      "smoke": {
+        "pipeline_id": 42,
+        "template_parameters": {
+          "stackName": {"from": "instance.name"},
+          "branch": {"from": "instance.branch"},
+          "suite": {"from": "suite"}
+        }
+      },
+      "full": {
+        "pipeline_id": 42,
+        "template_parameters": {
+          "stackName": {"from": "instance.name"},
+          "branch": {"from": "instance.branch"},
+          "suite": {"from": "suite"}
+        }
+      }
+    }
+  # One suite with an optional workers parameter (hooks-config.one-suite.json):
+  # {"e2e": {"pipeline_id": 42, "template_parameters": {
+  #   "stackName": {"from": "instance.name"},
+  #   "workers": {"from": "parameter", "parameter": "workers", "values": ["1", "2", "3"]}}}}
+  # Empty: ADO uses the default branch of the pipeline.
+  PIPELINE_SOURCE_BRANCH: ""
+  POLL_INTERVAL_SECONDS: "15"
+  # Longer than the run time of the pipeline (at most 240). The web UI stops
+  # polling after 60 minutes; a new "Run tests" returns the running job.
+  TEST_TIMEOUT_MINUTES: "120"
+  # Maximum running jobs. 0: no cap.
+  MAX_RUNNING_JOBS: "3"
+  JOB_RETENTION_HOURS: "24"
+  SHUTDOWN_TIMEOUT_SECONDS: "30"
+  # Client ID of the managed identity or app registration with the
+  # federated credential for system:serviceaccount:extensions:ci-test-runner.
+  AZURE_CLIENT_ID: "REPLACE_ME"
+  AZURE_TENANT_ID: "REPLACE_ME"
+  AZURE_FEDERATED_TOKEN_FILE: "/var/run/secrets/azure/tokens/azure-identity-token"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ci-test-runner
+  namespace: extensions
+  labels:
+    app: ci-test-runner
+spec:
+  # Keep one replica. The jobs live in the memory of the pod, so another
+  # replica answers 404 for them.
+  replicas: 1
+  # Recreate: a rollout loses the jobs anyway, and two pods at the same time
+  # would split the jobs.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ci-test-runner
+  template:
+    metadata:
+      labels:
+        app: ci-test-runner
+    spec:
+      serviceAccountName: ci-test-runner
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      # Longer than SHUTDOWN_TIMEOUT_SECONDS, so in-flight requests can finish.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: ci-test-runner
+          image: ghcr.io/omattsson/k8s-stack-manager-extensions/ci-test-runner:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: ci-test-runner-secret
+            - configMapRef:
+                name: ci-test-runner-config
+          volumeMounts:
+            - name: azure-identity-token
+              mountPath: /var/run/secrets/azure/tokens
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Readiness uses /healthz on purpose. /readyz depends on Entra ID
+          # and Azure DevOps. A short outage there would remove the pod from
+          # the Service, and the job logs would stop. Check /readyz by hand
+          # after a deploy or a credential change.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: azure-identity-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: azure-identity-token
+                  audience: api://AzureADTokenExchange
+                  expirationSeconds: 3600
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ci-test-runner
+  namespace: extensions
+spec:
+  selector:
+    app: ci-test-runner
+  ports:
+    - port: 8080
+      targetPort: 8080
