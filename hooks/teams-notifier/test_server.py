@@ -914,7 +914,7 @@ class TestHTTPHandlerEvents(unittest.TestCase):
 class TestClusterName(unittest.TestCase):
     """Cards show the cluster name when the envelope has `cluster_name`, else the ID."""
 
-    NAMED = {**SAMPLE_ENVELOPE["instance"], "cluster_id": "d23adba9-1111", "cluster_name": "kvk-k8s-dev"}
+    NAMED = {**SAMPLE_ENVELOPE["instance"], "cluster_id": "d23adba9-1111", "cluster_name": "dev-cluster"}
 
     def test_cluster_label(self):
         cases = [
@@ -932,7 +932,7 @@ class TestClusterName(unittest.TestCase):
         with patch.object(server, "_card_template", None):
             card = server.build_adaptive_card(env)
         facts = {f["title"]: f["value"] for f in card["attachments"][0]["content"]["body"][1]["facts"]}
-        self.assertEqual(facts["Cluster"], "kvk-k8s-dev")
+        self.assertEqual(facts["Cluster"], "dev-cluster")
 
     def test_deploy_card_falls_back_to_id(self):
         with patch.object(server, "_card_template", None):
@@ -942,7 +942,7 @@ class TestClusterName(unittest.TestCase):
 
     def test_template_variables(self):
         v = server.build_template_variables({**SAMPLE_ENVELOPE, "instance": self.NAMED})
-        self.assertEqual(v["cluster_name"], "kvk-k8s-dev")
+        self.assertEqual(v["cluster_name"], "dev-cluster")
         self.assertEqual(v["cluster_id"], "d23adba9-1111")
         self.assertEqual(server.build_template_variables(SAMPLE_ENVELOPE)["cluster_name"], "dev")
 
@@ -950,7 +950,7 @@ class TestClusterName(unittest.TestCase):
         env = _event_envelope("stop-completed")
         env["instance"] = {**self.NAMED, "status": "stopped"}
         _, facts, _ = _card_texts(server.build_hook_card(env))
-        self.assertEqual(facts["Cluster"], "kvk-k8s-dev")
+        self.assertEqual(facts["Cluster"], "dev-cluster")
 
     def test_name_is_escaped(self):
         env = _event_envelope("stop-completed")
@@ -964,9 +964,9 @@ class TestClusterName(unittest.TestCase):
         _, facts, _ = _card_texts(server.build_hook_card(run))
         self.assertEqual(facts["Cluster"], "all")
         run["cleanup_policy"]["cluster_id"] = "d23adba9-1111"
-        run["cleanup_policy"]["cluster_name"] = "kvk-k8s-dev"
+        run["cleanup_policy"]["cluster_name"] = "dev-cluster"
         _, facts, _ = _card_texts(server.build_hook_card(run))
-        self.assertEqual(facts["Cluster"], "kvk-k8s-dev")
+        self.assertEqual(facts["Cluster"], "dev-cluster")
 
 
 if __name__ == "__main__":
