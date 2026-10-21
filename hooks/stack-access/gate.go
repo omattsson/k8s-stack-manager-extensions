@@ -15,6 +15,7 @@ import (
 const (
 	resultBypass   = "bypass"
 	resultOK       = "ok"
+	resultShared   = "shared"
 	resultDisabled = "disabled"
 	resultDenied   = "denied"
 	resultNotReady = "not_ready"
@@ -54,6 +55,14 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.deny(w, r, host, ip, instance, err.Error())
 		return
 	}
+	user, pass, hasAuth := r.BasicAuth()
+	if hasAuth && g.cfg.SharedUser != "" && credentialsMatch(user, pass, g.cfg.SharedUser, g.cfg.SharedPassword) {
+		// These credentials open every stack, so each use is visible at debug
+		// level.
+		slog.Debug("Shared credentials accepted", "host", host, "client_ip", ipString(ip))
+		g.allow(w, resultShared)
+		return
+	}
 	sec, err := g.store.secret(ns.Name)
 	if err != nil {
 		g.deny(w, r, host, ip, instance, err.Error())
@@ -68,12 +77,11 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.allow(w, resultDisabled)
 		return
 	}
-	user, pass, hasAuth := r.BasicAuth()
 	if !hasAuth {
 		g.deny(w, r, host, ip, instance, "no credentials")
 		return
 	}
-	if !equalSecret(user, creds.Username) || !equalSecret(pass, creds.Password) {
+	if !credentialsMatch(user, pass, creds.Username, creds.Password) {
 		g.deny(w, r, host, ip, instance, "wrong credentials")
 		return
 	}
@@ -123,6 +131,14 @@ func (g *gate) deny(w http.ResponseWriter, r *http.Request, host string, ip neti
 	w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
 	w.Header().Set("Cache-Control", "no-store")
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+}
+
+// credentialsMatch compares both values every time, so the time does not show
+// whether the user name matched.
+func credentialsMatch(user, pass, wantUser, wantPass string) bool {
+	u := equalSecret(user, wantUser)
+	p := equalSecret(pass, wantPass)
+	return u && p
 }
 
 // equalSecret compares in constant time. Hashing first hides the length.

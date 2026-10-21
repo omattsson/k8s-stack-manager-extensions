@@ -100,6 +100,44 @@ func TestLoadConfig(t *testing.T) {
 			wantErr: "LISTEN_ADDR",
 		},
 		{
+			name: "shared credentials",
+			env:  map[string]string{"STACK_ACCESS_SECRET": "s", "LEADER_ELECTION_ENABLED": "false", "SHARED_CREDENTIALS": "ci:shared-password-1234:with-colon"},
+			check: func(t *testing.T, c config) {
+				if c.SharedUser != "ci" || c.SharedPassword != "shared-password-1234:with-colon" {
+					t.Errorf("shared = %q / %q", c.SharedUser, c.SharedPassword)
+				}
+			},
+		},
+		{
+			name:    "shared credentials without a colon",
+			env:     map[string]string{"STACK_ACCESS_SECRET": "s", "LEADER_ELECTION_ENABLED": "false", "SHARED_CREDENTIALS": "shared-password-12345678"},
+			wantErr: "SHARED_CREDENTIALS",
+		},
+		{
+			name:    "shared credentials with a short password",
+			env:     map[string]string{"STACK_ACCESS_SECRET": "s", "LEADER_ELECTION_ENABLED": "false", "SHARED_CREDENTIALS": "ci:123456789012345"},
+			wantErr: "at least 16",
+		},
+		{
+			name: "shared credentials with exactly 16 bytes and a trailing newline",
+			env:  map[string]string{"STACK_ACCESS_SECRET": "s", "LEADER_ELECTION_ENABLED": "false", "SHARED_CREDENTIALS": "ci:1234567890123456\n"},
+			check: func(t *testing.T, c config) {
+				if c.SharedPassword != "1234567890123456" {
+					t.Errorf("password = %q", c.SharedPassword)
+				}
+			},
+		},
+		{
+			name:    "shared credentials with a space at the end",
+			env:     map[string]string{"STACK_ACCESS_SECRET": "s", "LEADER_ELECTION_ENABLED": "false", "SHARED_CREDENTIALS": "ci:1234567890123456 "},
+			wantErr: "spaces",
+		},
+		{
+			name:    "shared credentials without a user",
+			env:     map[string]string{"STACK_ACCESS_SECRET": "s", "LEADER_ELECTION_ENABLED": "false", "SHARED_CREDENTIALS": " :shared-password-1234"},
+			wantErr: "SHARED_CREDENTIALS",
+		},
+		{
 			name: "default disabled",
 			env:  map[string]string{"STACK_ACCESS_SECRET": "s", "LEADER_ELECTION_ENABLED": "false", "DEFAULT_ENABLED": "false"},
 			check: func(t *testing.T, c config) {
@@ -117,6 +155,9 @@ func TestLoadConfig(t *testing.T) {
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, tt.wantErr)
+				}
+				if v := tt.env["SHARED_CREDENTIALS"]; v != "" && strings.Contains(err.Error(), v) {
+					t.Fatal("the error holds the shared credentials")
 				}
 				return
 			}

@@ -133,6 +133,13 @@ spec:
                 secretKeyRef:
                   name: stack-access-secret
                   key: STACK_ACCESS_SECRET
+            # Optional user:password that passes on every stack (CI).
+            - name: SHARED_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: stack-access-secret
+                  key: SHARED_CREDENTIALS
+                  optional: true
             # Requests from these ranges pass without a password (for
             # example the office and the VPN). Empty: nobody passes without one.
             - name: BYPASS_CIDRS

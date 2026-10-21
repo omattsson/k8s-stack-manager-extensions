@@ -35,16 +35,18 @@ The password lives in a Secret `stack-basic-auth` in the stack namespace. It nev
 
 1. The client IP is the right-most `X-Forwarded-For` entry. With `trustForwardHeader: false`, Traefik sets it from the TCP peer, so a client cannot choose it. An IP in `BYPASS_CIDRS` passes.
 2. `HOST_PATTERN` gets the stack name from `X-Forwarded-Host`. The stack namespace is the namespace whose `INSTANCE_LABEL` has that name.
-3. A Secret with `enabled: "false"` passes.
-4. A request with the right user name and password passes (constant-time compare).
-5. Every other request gets 401 with `WWW-Authenticate: Basic realm="<stack name>"`. This includes an unknown host, a missing namespace or Secret, and two namespaces with the same stack name (fail closed). Set `UNIQUE_INSTANCE_NAMES=true` in k8s-stack-manager when the stack names are in the host names.
-6. Before the cache is synced, the answer is 503, and `/readyz` keeps the pod out of the Service.
+3. A request with the shared credentials (`SHARED_CREDENTIALS`, for example for CI) passes on every stack, also on a stack without a Secret or with the password turned off.
+4. A Secret with `enabled: "false"` passes.
+5. A request with the right user name and password of the stack passes (constant-time compare).
+6. Without the shared credentials, every other request gets 401 with `WWW-Authenticate: Basic realm="<stack name>"`. This includes an unknown host, a missing namespace or Secret, and two namespaces with the same stack name (fail closed). Set `UNIQUE_INSTANCE_NAMES=true` in k8s-stack-manager when the stack names are in the host names.
+7. Before the cache is synced, the answer is 503, and `/readyz` keeps the pod out of the Service.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `STACK_ACCESS_SECRET` | required | HMAC secret of the actions. The same value as the `secret_env` in the k8s-stack-manager hooks config. |
+| `SHARED_CREDENTIALS` | empty | Optional `user:password` (password of at least 16 bytes, no spaces at the start or end; a trailing newline is removed) that passes on every stack, for example for end-to-end tests on build agents without a fixed IP. Read it from a Secret. |
 | `ALLOW_UNSIGNED` | `false` | `true` accepts unsigned actions when `STACK_ACCESS_SECRET` is empty (local tests only). |
 | `BYPASS_CIDRS` | empty | Comma list of IPs or CIDRs that pass without a password. `/0` is refused. |
 | `URL_TEMPLATE` | empty | The URL in the `show` and `rotate` results, for example `https://{instance}.stacks.example.com`. |
@@ -71,7 +73,7 @@ The password lives in a Secret `stack-basic-auth` in the stack namespace. It nev
 | `POST /actions/show`, `/actions/rotate`, `/actions/set` | k8s-stack-manager actions (HMAC-signed `ActionRequest`). |
 | `GET /healthz` | Liveness: the process runs. |
 | `GET /readyz` | Readiness: the cache is synced and the process does not stop. |
-| `GET /metrics` | Prometheus: `stack_access_auth_requests_total{result}` (`bypass`, `ok`, `disabled`, `denied`, `not_ready`), `stack_access_action_requests_total{action,code}`, `stack_access_secrets_created_total`, `stack_access_leader`. |
+| `GET /metrics` | Prometheus: `stack_access_auth_requests_total{result}` (`bypass`, `shared`, `ok`, `disabled`, `denied`, `not_ready`), `stack_access_action_requests_total{action,code}`, `stack_access_secrets_created_total`, `stack_access_leader`. |
 
 ### Actions
 
@@ -102,6 +104,7 @@ Paths that must stay open (callbacks of other services, APIs with Bearer tokens,
 ## Security notes
 
 - The bypass trusts the TCP peer that Traefik sees. Run Traefik with `externalTrafficPolicy: Local` (or another setup that keeps the client IP), and never with trusted forwarded headers for the internet.
+- `SHARED_CREDENTIALS` opens the basic auth of every stack, and basic auth has no lockout. Use a random password, for example `openssl rand -base64 24`. Give it only to an automated client that masks it (for example a secret pipeline variable), and limit the client to the stack hosts (Playwright `httpCredentials` with `origin`). The service reads it at start: after a change of the Secret, restart the pods (`kubectl -n extensions rollout restart deployment/stack-access`). Each use logs at debug level with the host and the client IP.
 - Basic auth has no lockout. A 24-character random password (about 139 bits) makes guessing impractical.
 - The logs hold the host, the path (without the query), the client IP and the reason. They never hold the `Authorization` header or a password.
 - RBAC lets the service create any Secret; the admission policy limits it to Opaque Secrets named `stack-basic-auth` in stack namespaces. Without the policy the service account could create a service-account-token Secret and read the token. For tighter rights, bind the write rules in each stack namespace (for example with the k8s-stack-manager `backend.namespaceRoleBindings`) and keep only the read rules cluster-wide.
