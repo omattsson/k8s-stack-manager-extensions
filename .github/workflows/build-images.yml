@@ -29,6 +29,7 @@ jobs:
           - maintenance-gate
           - security-scan-gate
           - slack-notifier
+          - stack-access
           - teams-notifier
           - webhook-relay
     steps:

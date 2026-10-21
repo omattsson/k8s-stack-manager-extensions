@@ -60,6 +60,23 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+  test-stack-access:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./hooks/stack-access
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: hooks/stack-access/go.mod
+          cache-dependency-path: hooks/stack-access/go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+
   test-python-hooks:
     runs-on: ubuntu-latest
     strategy:

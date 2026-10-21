@@ -15,6 +15,7 @@ These extensions use the [webhook extension system](https://github.com/omattsson
 | [security-scan-gate](hooks/security-scan-gate/) | Event hook | Go | Block deploys when images have critical CVEs (Trivy) |
 | [debug-bundle](hooks/debug-bundle/) | Action | Go | Collect pod logs, events, and diagnostics into a downloadable archive |
 | [ci-test-runner](hooks/ci-test-runner/) | Action | Go | Run an Azure DevOps test pipeline against a stack and show the progress and test summary in the job log |
+| [stack-access](hooks/stack-access/) | Traefik forwardAuth and actions | Go | HTTP basic auth in front of each stack: one password for each stack, an IP bypass, and actions to show, rotate or turn off the password |
 
 ## Quick Start
 

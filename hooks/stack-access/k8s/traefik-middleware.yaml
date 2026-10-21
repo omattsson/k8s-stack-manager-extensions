@@ -1,0 +1,39 @@
+# Traefik middleware for the stack Ingresses. Reference it on an Ingress with
+#   traefik.ingress.kubernetes.io/router.middlewares: extensions-stack-access@kubernetescrd
+# Traefik needs providers.kubernetesCRD.allowCrossNamespace=true, because the
+# Ingresses are in the stack namespaces.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: stack-access-auth
+  namespace: extensions
+spec:
+  forwardAuth:
+    address: http://stack-access.extensions.svc.cluster.local:8080/auth
+    # false: Traefik sends the TCP peer as X-Forwarded-For, so a client cannot
+    # choose the address that the bypass ranges check.
+    trustForwardHeader: false
+---
+# Removes the basic auth header after the check, so the app does not get it.
+# A path whose app reads the Authorization header (for example a Bearer token
+# API) needs its own Ingress without this middleware.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: stack-access-strip
+  namespace: extensions
+spec:
+  headers:
+    customRequestHeaders:
+      Authorization: ""
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: stack-access
+  namespace: extensions
+spec:
+  chain:
+    middlewares:
+      - name: stack-access-auth
+      - name: stack-access-strip

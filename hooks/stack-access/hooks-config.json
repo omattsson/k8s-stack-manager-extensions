@@ -1,0 +1,32 @@
+{
+    "actions": [
+        {
+            "name": "stack-access-show",
+            "label": "Show external access",
+            "description": "Shows the URL, the user name and the password of the basic auth in front of this stack.",
+            "url": "http://stack-access.extensions.svc.cluster.local:8080/actions/show",
+            "secret_env": "STACK_ACCESS_SECRET",
+            "timeout_seconds": 15
+        },
+        {
+            "name": "stack-access-rotate",
+            "label": "Rotate external password",
+            "description": "Makes a new password for the basic auth in front of this stack.",
+            "confirm": "The old password stops working within a few seconds. People who use it must get the new password.",
+            "url": "http://stack-access.extensions.svc.cluster.local:8080/actions/rotate",
+            "secret_env": "STACK_ACCESS_SECRET",
+            "timeout_seconds": 15
+        },
+        {
+            "name": "stack-access-set",
+            "label": "Turn external password on or off",
+            "description": "Turns the basic auth in front of this stack on or off. Off: everybody who knows the URL can open the stack.",
+            "url": "http://stack-access.extensions.svc.cluster.local:8080/actions/set",
+            "secret_env": "STACK_ACCESS_SECRET",
+            "timeout_seconds": 15,
+            "parameters": [
+                {"name": "enabled", "label": "Password required", "type": "bool", "required": true, "default": true}
+            ]
+        }
+    ]
+}
