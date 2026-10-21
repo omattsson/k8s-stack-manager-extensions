@@ -1,0 +1,42 @@
+# Required. Limits the stack-access service account: it may create and change
+# only Opaque Secrets named stack-basic-auth, and only in stack namespaces.
+# RBAC cannot limit "create" to one name. Without this policy the service
+# account could create a service-account-token Secret in any namespace and
+# read the token. Needs Kubernetes 1.30 or later.
+# Change the label below when NAMESPACE_SELECTOR is not the default.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: stack-access-secrets
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["secrets"]
+  matchConditions:
+    - name: stack-access-service-account
+      expression: 'request.userInfo.username == "system:serviceaccount:extensions:stack-access"'
+  validations:
+    - expression: 'object.metadata.name == "stack-basic-auth"'
+      message: "stack-access may write only Secrets named stack-basic-auth"
+    - expression: >-
+        object.type == 'Opaque' &&
+        (!has(object.metadata.annotations) ||
+         !('kubernetes.io/service-account.name' in object.metadata.annotations))
+      message: "stack-access may write only Opaque Secrets"
+    - expression: >-
+        namespaceObject != null && has(namespaceObject.metadata.labels) &&
+        'managed-by' in namespaceObject.metadata.labels &&
+        namespaceObject.metadata.labels['managed-by'] == 'k8s-stack-manager'
+      message: "stack-access may write Secrets only in stack namespaces"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: stack-access-secrets
+spec:
+  policyName: stack-access-secrets
+  validationActions: [Deny]

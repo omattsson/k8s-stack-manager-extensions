@@ -19,7 +19,8 @@ Two types of extensions:
 ## Languages
 
 - **Go** (`debug-bundle`, `security-scan-gate`): `net/http`, no external deps. Uses external binaries (`kubectl`, `trivy`).
-- **Go** (`ci-trigger-gate`, `ci-test-runner`): `net/http` plus the Azure SDK `azidentity` module for workload identity. These are the only Go hooks with external deps.
+- **Go** (`ci-trigger-gate`, `ci-test-runner`): `net/http` plus the Azure SDK `azidentity` module for workload identity.
+- **Go** (`stack-access`): `net/http` plus `k8s.io/client-go` (informers and Lease leader election).
 - **Python** (`maintenance-gate`, `slack-notifier`): `http.server`, stdlib only — no Flask or other frameworks.
 
 ## Build
@@ -36,7 +37,7 @@ Go hooks: `go run .` | Python hooks: `python3 server.py`
 - All containers run as non-root with minimal permissions.
 - Every hook exposes `/healthz` for liveness/readiness probes.
 - Kubernetes manifests deploy into the `extensions` namespace.
-- No external library dependencies — Go and Python use only standard libraries. Exception: `ci-trigger-gate` and `ci-test-runner` use `azidentity` for workload identity.
+- No external library dependencies — Go and Python use only standard libraries. Exceptions: `ci-trigger-gate` and `ci-test-runner` use `azidentity` for workload identity; `stack-access` uses `client-go`.
 
 ## Adding a New Hook
 
