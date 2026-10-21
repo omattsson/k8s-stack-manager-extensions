@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func TestGate(t *testing.T) {
@@ -160,6 +162,70 @@ func TestGateEdgeCases(t *testing.T) {
 			}
 			w := httptest.NewRecorder()
 			g.ServeHTTP(w, r)
+			if w.Code != tt.want {
+				t.Fatalf("status = %d, want %d", w.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestGateSharedCredentials(t *testing.T) {
+	t.Parallel()
+	const sharedPass = "shared-password-1234567"
+	objs := []runtime.Object{
+		stackNamespace("stack-demo-alice", "demo"),
+		accessSecret("stack-demo-alice", "demo", demoPassword, true),
+		stackNamespace("stack-other-bob", "other"),
+		accessSecret("stack-other-bob", "other", "other-password-12345678", true),
+		stackNamespace("stack-new-carol", "new"),
+		stackNamespace("stack-twin-a", "twin"),
+		stackNamespace("stack-twin-b", "twin"),
+	}
+	withShared := testConfig(t, map[string]string{"SHARED_CREDENTIALS": "ci:" + sharedPass})
+	st, _ := newTestStore(t, withShared, objs...)
+	g := &gate{store: st, metrics: newMetrics(), cfg: withShared}
+
+	withoutShared := testConfig(t, nil)
+	st2, _ := newTestStore(t, withoutShared, objs...)
+	g2 := &gate{store: st2, metrics: newMetrics(), cfg: withoutShared}
+
+	// The parallel subtests end before the cleanup of the parent runs.
+	t.Cleanup(func() {
+		g.metrics.mu.Lock()
+		defer g.metrics.mu.Unlock()
+		if g.metrics.auth[resultShared] != 3 {
+			t.Errorf("shared results = %d, want 3", g.metrics.auth[resultShared])
+		}
+	})
+
+	tests := []struct {
+		name string
+		g    *gate
+		host string
+		user string
+		pass string
+		want int
+	}{
+		{name: "shared on one stack", g: g, host: "demo.example.com", user: "ci", pass: sharedPass, want: 200},
+		{name: "shared on another stack", g: g, host: "other.example.com", user: "ci", pass: sharedPass, want: 200},
+		{name: "shared on a stack without a secret yet", g: g, host: "new.example.com", user: "ci", pass: sharedPass, want: 200},
+		{name: "own credentials still work", g: g, host: "demo.example.com", user: "demo", pass: demoPassword, want: 200},
+		{name: "shared with a wrong password", g: g, host: "demo.example.com", user: "ci", pass: "nope", want: 401},
+		{name: "shared password with a wrong user", g: g, host: "demo.example.com", user: "admin", pass: sharedPass, want: 401},
+		{name: "shared on two namespaces with one name", g: g, host: "twin.example.com", user: "ci", pass: sharedPass, want: 401},
+		{name: "shared on an unknown host", g: g, host: "ghost.example.com", user: "ci", pass: sharedPass, want: 401},
+		{name: "shared not configured", g: g2, host: "demo.example.com", user: "ci", pass: sharedPass, want: 401},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequest(http.MethodGet, "/auth", nil)
+			r.Header.Set("X-Forwarded-Host", tt.host)
+			r.Header.Set("X-Forwarded-For", "198.51.100.7")
+			r.SetBasicAuth(tt.user, tt.pass)
+			w := httptest.NewRecorder()
+			tt.g.ServeHTTP(w, r)
 			if w.Code != tt.want {
 				t.Fatalf("status = %d, want %d", w.Code, tt.want)
 			}

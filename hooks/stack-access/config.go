@@ -31,6 +31,8 @@ type config struct {
 	SecretName        string
 	URLTemplate       string
 	Secret            string
+	SharedUser        string
+	SharedPassword    string
 	LeaseName         string
 	PodName           string
 	PodNamespace      string
@@ -124,6 +126,19 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, fmt.Errorf("LISTEN_ADDR: %w", perr)
 	} else {
 		cfg.ListenPort = port
+	}
+
+	// A Secret made from a file often ends with a newline.
+	if v := strings.TrimRight(getenv("SHARED_CREDENTIALS"), "\r\n"); v != "" {
+		user, pass, ok := strings.Cut(v, ":")
+		// Never echo the value: it is a password.
+		if !ok || user == "" || len(pass) < 16 {
+			return config{}, errors.New("SHARED_CREDENTIALS must be user:password with a password of at least 16 bytes")
+		}
+		if strings.TrimSpace(user) != user || strings.TrimSpace(pass) != pass {
+			return config{}, errors.New("SHARED_CREDENTIALS must not have spaces at the start or end of the user or the password")
+		}
+		cfg.SharedUser, cfg.SharedPassword = user, pass
 	}
 
 	if cfg.Secret == "" && !cfg.AllowUnsigned {
