@@ -26,6 +26,29 @@ These extensions use the [webhook extension system](https://github.com/omattsson
 
 See the [Extending k8s-stack-manager](https://github.com/omattsson/k8s-stack-manager/blob/main/EXTENDING.md) guide for the full protocol reference.
 
+## Per-team extensions (`applies_to`)
+
+Teams often need different extensions: team A's stacks use Postgres and team B's use MySQL, or each team has its own test pipeline. Give each action or subscription in `HOOKS_CONFIG_FILE` an `applies_to`, and each team's stacks show and run only their own:
+
+```json
+{
+  "actions": [
+    {"name": "run-tests-team-a", "label": "Run tests", "url": "http://ci-test-runner-team-a.extensions.svc.cluster.local:8080/action",
+     "secret_env": "CI_TEST_RUNNER_SECRET", "applies_to": {"template_categories": ["team-a"]}},
+    {"name": "run-tests-team-b", "label": "Run tests", "url": "http://ci-test-runner-team-b.extensions.svc.cluster.local:8080/action",
+     "secret_env": "CI_TEST_RUNNER_SECRET", "applies_to": {"template_categories": ["team-b"]}}
+  ]
+}
+```
+
+- Keys: `template_ids`, `template_categories` (trimmed, case-insensitive), `definition_ids`, `cluster_ids`. Fields combine with AND, values with OR. Empty or missing: every stack.
+- The template is the one of the stack's definition. A stack without a template matches no template scope.
+- An action outside its scope is not listed, and invoking it answers 404. A subscription with `applies_to` gets only the events of those stacks. `applies_to` cannot be used with `cleanup-policy-executed`.
+- One extension can also route by itself: the envelope and the action request carry `instance.template_id`, `instance.template_name` and `instance.template_category` (omitted when the stack has no template).
+- **Server version:** a k8s-stack-manager version without `applies_to` ignores it, and the extension applies to every stack. Upgrade k8s-stack-manager first.
+
+The full rules are in [Limit to some instances](https://github.com/omattsson/k8s-stack-manager/blob/main/backend/docs/hooks.md#limit-to-some-instances-applies_to) and [Per-team hooks and actions](https://github.com/omattsson/k8s-stack-manager/blob/main/EXTENDING.md#per-team-hooks-and-actions).
+
 ## Extension Structure
 
 Each extension follows the same layout:

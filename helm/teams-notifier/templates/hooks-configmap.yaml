@@ -2,6 +2,9 @@
 {{- if not .Values.events }}
 {{- fail "events must list at least one hook event" }}
 {{- end }}
+{{- if and .Values.hooksConfig.appliesTo (has "cleanup-policy-executed" .Values.events) }}
+{{- fail "hooksConfig.appliesTo cannot be used with the cleanup-policy-executed event: remove it from events" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,6 +24,9 @@ data:
           "url": "{{ include "teams-notifier.serviceUrl" . }}/hook",
           "timeout_seconds": {{ .Values.hooksConfig.timeoutSeconds }},
           "failure_policy": {{ .Values.hooksConfig.failurePolicy | quote }},
+          {{- with .Values.hooksConfig.appliesTo }}
+          "applies_to": {{ toJson . }},
+          {{- end }}
           "secret_env": "TEAMS_NOTIFIER_HOOK_SECRET"
         }
       ]
