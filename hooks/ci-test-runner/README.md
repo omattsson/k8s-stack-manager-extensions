@@ -429,6 +429,21 @@ Merge one of these into the hooks configuration of k8s-stack-manager.
 }
 ```
 
+**One test pipeline per team:** run one runner for each team (each with its own `TEST_PIPELINES`), and register one action for each with the same label and an `applies_to` (k8s-stack-manager with `applies_to`). Each team's stacks then show only their own "Run tests":
+
+```json
+{
+    "actions": [
+        {"name": "run-tests-team-a", "label": "Run tests", "url": "http://ci-test-runner-team-a.extensions.svc.cluster.local:8080/action",
+         "secret_env": "CI_TEST_RUNNER_SECRET", "timeout_seconds": 30, "log_path": "/jobs/{job_id}/log",
+         "applies_to": {"template_categories": ["team-a"]}},
+        {"name": "run-tests-team-b", "label": "Run tests", "url": "http://ci-test-runner-team-b.extensions.svc.cluster.local:8080/action",
+         "secret_env": "CI_TEST_RUNNER_SECRET", "timeout_seconds": 30, "log_path": "/jobs/{job_id}/log",
+         "applies_to": {"template_categories": ["team-b"]}}
+    ]
+}
+```
+
 - `timeout_seconds: 30`: the runner answers within 25 seconds of the request arrival, also when ADO is slow or another request for the same stack is in progress.
 - `log_path` makes the action asynchronous. k8s-stack-manager adds `job_id` to the action result, and the web UI polls the job log.
 - Set the same secret in `CI_TEST_RUNNER_SECRET` of the runner and of the k8s-stack-manager backend.

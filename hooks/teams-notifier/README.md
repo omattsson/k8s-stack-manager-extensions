@@ -140,6 +140,17 @@ kubectl apply -f k8s/
 
 The Helm chart in [../../helm/teams-notifier](../../helm/teams-notifier) sets the subscription events and `TEAMS_EVENTS` from the value `events` (an empty list fails the render), and `TEAMS_POLICY_INSTANCE_CARDS` from `policyInstanceCards`.
 
+To post cards only for some stacks, for example the stacks of one team's templates, set `hooksConfig.appliesTo` (the `applies_to` of the subscription, see [Per-team extensions](../../README.md#per-team-extensions-applies_to)):
+
+```yaml
+hooksConfig:
+  appliesTo:
+    template_categories: ["team-a"]
+events: [deploy-finalized, stop-completed, clean-completed, delete-completed, rollback-completed]
+```
+
+`applies_to` cannot be used with `cleanup-policy-executed` (one event for many stacks), so remove that event; the render fails otherwise.
+
 ## Message Format
 
 **Deploy success:**

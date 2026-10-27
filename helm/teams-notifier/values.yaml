@@ -69,3 +69,13 @@ hooksConfig:
   # Hook subscription settings
   timeoutSeconds: 10
   failurePolicy: ignore
+  # Optional: send cards only for some stacks (k8s-stack-manager applies_to,
+  # needs a k8s-stack-manager version with applies_to; an older one ignores
+  # it and posts for every stack). Keys: template_ids, template_categories,
+  # definition_ids, cluster_ids. Fields combine with AND, values with OR.
+  # applies_to cannot be used with cleanup-policy-executed: remove that event
+  # from events when you set appliesTo (the render fails otherwise).
+  # Example:
+  #   appliesTo:
+  #     template_categories: ["team-a"]
+  appliesTo: {}

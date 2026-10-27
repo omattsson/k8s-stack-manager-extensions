@@ -13,8 +13,9 @@ hooks/<name>/
 ```
 
 Two types of extensions:
-- **Event hooks** (subscriptions): Subscribe to `pre-deploy`, `post-deploy`, `deploy-finalized`. Return `{ "allowed": true/false }` for gates.
+- **Event hooks** (subscriptions): Subscribe to lifecycle events such as `pre-deploy`, `post-deploy`, `deploy-finalized` (the full list is in the k8s-stack-manager [hooks reference](https://github.com/omattsson/k8s-stack-manager/blob/main/backend/docs/hooks.md#available-events)). Return `{ "allowed": true/false }` for gates.
 - **Actions**: User-initiated, return arbitrary JSON.
+- Both can be limited to some stacks with `applies_to` (templates, template categories, definitions, clusters); see [Per-team extensions](README.md#per-team-extensions-applies_to). The envelope `instance` carries `template_id`, `template_name` and `template_category`: optional fields, omitted when the stack has no template, so read them with a default.
 
 ## Languages
 
