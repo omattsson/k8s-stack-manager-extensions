@@ -10,6 +10,7 @@ hooks/<name>/
   hooks-config.json      # Registration config (actions or subscriptions)
   Dockerfile
   k8s/deployment.yaml
+helm/<name>/             # Optional Helm chart for a hook (today: teams-notifier)
 ```
 
 Two types of extensions:
@@ -22,9 +23,9 @@ Two types of extensions:
 - **Go** (`debug-bundle`, `security-scan-gate`): `net/http`, no external deps. Uses external binaries (`kubectl`, `trivy`).
 - **Go** (`ci-trigger-gate`, `ci-test-runner`): `net/http` plus the Azure SDK `azidentity` module for workload identity.
 - **Go** (`stack-access`): `net/http` plus `k8s.io/client-go` (informers and Lease leader election).
-- **Python** (`maintenance-gate`, `slack-notifier`): `http.server`, stdlib only — no Flask or other frameworks.
+- **Python** (`maintenance-gate`, `slack-notifier`, `teams-notifier`, `webhook-relay`): `http.server`, stdlib only — no Flask or other frameworks.
 
-## Build
+## Build and Test
 
 From any hook directory:
 ```sh
@@ -32,13 +33,31 @@ docker build -t <name>:latest .
 ```
 Go hooks: `go run .` | Python hooks: `python3 server.py`
 
+Tests, from the hook directory (CI: `.github/workflows/test-hooks.yml`):
+
+- Go: `go vet ./... && go test -race ./...` (CI runs only `go test ./...` for `debug-bundle` and `security-scan-gate`)
+- Python: `python3 -m unittest discover .`
+
+A new hook needs a job or matrix entry in `test-hooks.yml` and an entry in the `build-images.yml` matrix.
+
 ## Conventions
 
 - All hooks verify `X-StackManager-Signature` HMAC-SHA256 header using a shared secret from env vars.
 - All containers run as non-root with minimal permissions.
 - Every hook exposes `/healthz` for liveness/readiness probes.
-- Kubernetes manifests deploy into the `extensions` namespace.
+- Kubernetes manifests in `hooks/*/k8s/` deploy into the `extensions` namespace. Helm chart workloads set no namespace: they use the release namespace. The one exception is the hooks ConfigMap: `hooksConfig.namespace` can put it in the k8s-stack-manager namespace, because the backend pod mounts it there.
 - No external library dependencies — Go and Python use only standard libraries. Exceptions: `ci-trigger-gate` and `ci-test-runner` use `azidentity` for workload identity; `stack-access` uses `client-go`.
+
+## Review Checklist
+
+- Signature: verify `X-StackManager-Signature` over the raw request body before parsing it, with a constant-time compare (`hmac.compare_digest` in Python, `hmac.Equal` in Go). Never compare with `==`.
+- Read the request body through a size limit (`io.LimitReader` with a maximum in Go, a `Content-Length` cap in Python).
+- Every outbound HTTP call has a timeout (`urlopen(..., timeout=...)`, `http.Client{Timeout: ...}`).
+- Never log secrets, tokens, or webhook URLs (Slack and Teams webhook URLs carry a token), and never return them in a response. One exception: the `stack-access` actions "Show external access" and "Rotate external password" return the stack password in the action `result`, by design (k8s-stack-manager does not store the result). Keep it out of logs and errors there too.
+- Read optional envelope fields (`template_*`, `applies_to` data) with a default; older k8s-stack-manager versions omit them.
+- Python tests that change module globals (for example `server.SECRET`) restore them in `tearDown`/`tearDownClass`, and a test HTTP server is shut down, closed, and its thread joined.
+- A hook stays stdlib-only unless it is one of the exceptions above.
+- A new hook has tests, a non-root `Dockerfile`, probes on `/healthz`, and entries in `test-hooks.yml` and `build-images.yml`.
 
 ## Adding a New Hook
 
