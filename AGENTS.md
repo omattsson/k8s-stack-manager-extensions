@@ -45,8 +45,19 @@ A new hook needs a job or matrix entry in `test-hooks.yml` and an entry in the `
 - All hooks verify `X-StackManager-Signature` HMAC-SHA256 header using a shared secret from env vars.
 - All containers run as non-root with minimal permissions.
 - Every hook exposes `/healthz` for liveness/readiness probes.
-- Kubernetes manifests deploy into the `extensions` namespace.
+- Kubernetes manifests in `hooks/*/k8s/` deploy into the `extensions` namespace. Helm charts set no namespace: they use the release namespace.
 - No external library dependencies — Go and Python use only standard libraries. Exceptions: `ci-trigger-gate` and `ci-test-runner` use `azidentity` for workload identity; `stack-access` uses `client-go`.
+
+## Review Checklist
+
+- Signature: verify `X-StackManager-Signature` over the raw request body before parsing it, with a constant-time compare (`hmac.compare_digest` in Python, `hmac.Equal` in Go). Never compare with `==`.
+- Read the request body through a size limit (`io.LimitReader` with a maximum in Go, a `Content-Length` cap in Python).
+- Every outbound HTTP call has a timeout (`urlopen(..., timeout=...)`, `http.Client{Timeout: ...}`).
+- Never log or return secrets, tokens, or webhook URLs (Slack and Teams webhook URLs carry a token).
+- Read optional envelope fields (`template_*`, `applies_to` data) with a default; older k8s-stack-manager versions omit them.
+- Python tests that change module globals (for example `server.SECRET`) restore them in `tearDown`/`tearDownClass`, and a test HTTP server is shut down, closed, and its thread joined.
+- A hook stays stdlib-only unless it is one of the exceptions above.
+- A new hook has tests, a non-root `Dockerfile`, probes on `/healthz`, and entries in `test-hooks.yml` and `build-images.yml`.
 
 ## Adding a New Hook
 
