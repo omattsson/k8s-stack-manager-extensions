@@ -53,7 +53,7 @@ A new hook needs a job or matrix entry in `test-hooks.yml` and an entry in the `
 - Signature: verify `X-StackManager-Signature` over the raw request body before parsing it, with a constant-time compare (`hmac.compare_digest` in Python, `hmac.Equal` in Go). Never compare with `==`.
 - Read the request body through a size limit (`io.LimitReader` with a maximum in Go, a `Content-Length` cap in Python).
 - Every outbound HTTP call has a timeout (`urlopen(..., timeout=...)`, `http.Client{Timeout: ...}`).
-- Never log or return secrets, tokens, or webhook URLs (Slack and Teams webhook URLs carry a token).
+- Never log secrets, tokens, or webhook URLs (Slack and Teams webhook URLs carry a token), and never return them in a response. One exception: the `stack-access` actions "Show external access" and "Rotate external password" return the stack password in the action `result`, by design (k8s-stack-manager does not store the result). Keep it out of logs and errors there too.
 - Read optional envelope fields (`template_*`, `applies_to` data) with a default; older k8s-stack-manager versions omit them.
 - Python tests that change module globals (for example `server.SECRET`) restore them in `tearDown`/`tearDownClass`, and a test HTTP server is shut down, closed, and its thread joined.
 - A hook stays stdlib-only unless it is one of the exceptions above.
