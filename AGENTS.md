@@ -10,6 +10,7 @@ hooks/<name>/
   hooks-config.json      # Registration config (actions or subscriptions)
   Dockerfile
   k8s/deployment.yaml
+helm/<name>/             # Optional Helm chart for a hook (today: teams-notifier)
 ```
 
 Two types of extensions:
@@ -22,15 +23,22 @@ Two types of extensions:
 - **Go** (`debug-bundle`, `security-scan-gate`): `net/http`, no external deps. Uses external binaries (`kubectl`, `trivy`).
 - **Go** (`ci-trigger-gate`, `ci-test-runner`): `net/http` plus the Azure SDK `azidentity` module for workload identity.
 - **Go** (`stack-access`): `net/http` plus `k8s.io/client-go` (informers and Lease leader election).
-- **Python** (`maintenance-gate`, `slack-notifier`): `http.server`, stdlib only — no Flask or other frameworks.
+- **Python** (`maintenance-gate`, `slack-notifier`, `teams-notifier`, `webhook-relay`): `http.server`, stdlib only — no Flask or other frameworks.
 
-## Build
+## Build and Test
 
 From any hook directory:
 ```sh
 docker build -t <name>:latest .
 ```
 Go hooks: `go run .` | Python hooks: `python3 server.py`
+
+Tests, from the hook directory (CI: `.github/workflows/test-hooks.yml`):
+
+- Go: `go vet ./... && go test -race ./...` (CI runs only `go test ./...` for `debug-bundle` and `security-scan-gate`)
+- Python: `python3 -m unittest discover .`
+
+A new hook needs a job or matrix entry in `test-hooks.yml` and an entry in the `build-images.yml` matrix.
 
 ## Conventions
 
