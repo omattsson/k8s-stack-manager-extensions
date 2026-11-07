@@ -45,7 +45,7 @@ A new hook needs a job or matrix entry in `test-hooks.yml` and an entry in the `
 - All hooks verify `X-StackManager-Signature` HMAC-SHA256 header using a shared secret from env vars.
 - All containers run as non-root with minimal permissions.
 - Every hook exposes `/healthz` for liveness/readiness probes.
-- Kubernetes manifests in `hooks/*/k8s/` deploy into the `extensions` namespace. Helm charts set no namespace: they use the release namespace.
+- Kubernetes manifests in `hooks/*/k8s/` deploy into the `extensions` namespace. Helm chart workloads set no namespace: they use the release namespace. The one exception is the hooks ConfigMap: `hooksConfig.namespace` can put it in the k8s-stack-manager namespace, because the backend pod mounts it there.
 - No external library dependencies — Go and Python use only standard libraries. Exceptions: `ci-trigger-gate` and `ci-test-runner` use `azidentity` for workload identity; `stack-access` uses `client-go`.
 
 ## Review Checklist
